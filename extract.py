@@ -193,6 +193,15 @@ MAX_RETRIES = 3  # Retry attempts for failed API calls
 RETRY_DELAY = 2  # Seconds between retries
 
 
+class PromptBlockedError(RuntimeError):
+    """Gemini refused the request at the safety pre-filter (PROHIBITED_CONTENT
+    etc.). Separate from generic RuntimeError because retrying another model
+    rarely helps — Google's pre-filter is broadly consistent across tiers —
+    and because the triage pipeline would rather bucket these as newsletter
+    noise than keep re-queueing them forever. See describe_email for the
+    auto-classify fallback."""
+
+
 def get_prompt(gist: bool = False) -> str:
     """Generate prompt with current date."""
     today = datetime.now().strftime("%B %d, %Y")
@@ -279,10 +288,24 @@ def describe_document(
     if use_cache and not dry_run:
         cached = get_cached_description(conn, content_hash, cache_key)
         if cached:
-            if not quiet:
-                console.print(f"[dim]Cached: {label}[/dim]")
-            conn.close()
-            return cached
+            # Cached rows whose Gist has `.error` set represent a previous
+            # failed attempt. Don't short-circuit on them — let the live
+            # call run again so that e.g. a safety-block can now fall
+            # through to describe_email's newsletter-fallback path. A
+            # successful retry will overwrite the error row via the
+            # INSERT OR REPLACE in save_description.
+            stale_error = False
+            if gist:
+                try:
+                    if Gist.model_validate_json(cached).error:
+                        stale_error = True
+                except Exception:
+                    pass
+            if not stale_error:
+                if not quiet:
+                    console.print(f"[dim]Cached: {label}[/dim]")
+                conn.close()
+                return cached
 
     api_key = get_api_key()
     if not api_key:
@@ -329,22 +352,30 @@ def describe_document(
                 return description
 
             # Empty response.text: the call succeeded but Gemini returned no
-            # output. Diagnose why so the UI shows something more useful than
-            # "NO RESPONSE". Usually this is a safety block or a finish_reason
-            # like MAX_TOKENS / RECITATION.
-            reason_bits = []
+            # output. Distinguish "hard-blocked by safety" from other oddities
+            # (MAX_TOKENS, RECITATION, etc.) so callers can treat safety blocks
+            # as a real classification result (usually: newsletter noise) and
+            # other empties as genuine failures worth retrying.
             pf = getattr(response, "prompt_feedback", None)
+            candidate_blocked = False
+            candidate_block_bits: list[str] = []
+            for cand in getattr(response, "candidates", None) or []:
+                sr = getattr(cand, "safety_ratings", None) or []
+                blocked = [r for r in sr if getattr(r, "blocked", False)]
+                if blocked:
+                    candidate_blocked = True
+                    cats = ",".join(str(getattr(r, "category", "?")) for r in blocked)
+                    candidate_block_bits.append(f"safety blocked: {cats}")
             if pf is not None and getattr(pf, "block_reason", None):
-                reason_bits.append(f"prompt blocked: {pf.block_reason}")
+                raise PromptBlockedError(f"prompt blocked: {pf.block_reason}")
+            if candidate_blocked:
+                raise PromptBlockedError("; ".join(candidate_block_bits))
+
+            reason_bits: list[str] = []
             for cand in getattr(response, "candidates", None) or []:
                 fr = getattr(cand, "finish_reason", None)
                 if fr and str(fr).rsplit(".", 1)[-1] != "STOP":
                     reason_bits.append(f"finish_reason={fr}")
-                sr = getattr(cand, "safety_ratings", None) or []
-                blocked = [r for r in sr if getattr(r, "blocked", False)]
-                if blocked:
-                    cats = ",".join(str(getattr(r, "category", "?")) for r in blocked)
-                    reason_bits.append(f"safety blocked: {cats}")
             reason = "; ".join(reason_bits) or "empty response.text"
             raise RuntimeError(f"Gemini returned no text ({reason})")
         except Exception as e:
@@ -444,13 +475,50 @@ def make_error_gist_json(error_msg: str, task: dict) -> str:
     return g.model_dump_json()
 
 
+def make_blocked_gist_json(from_addr: str | None, subject: str | None, fallback_label: str | None = None) -> str:
+    """Gist for an email whose content Gemini refused at the safety pre-filter.
+
+    The triage pipeline is for finding bills/obligations; if Google won't let
+    us inspect a message, it's almost always a Substack-style newsletter with
+    racy content, not an actionable invoice. Bucket as newsletter/broadcast/
+    frivolous so it's hidden by the default noise filter, and keep `error=None`
+    so `--retry-failed` doesn't pick it back up (retrying won't help — the
+    block is consistent across Gemini tiers). Real non-newsletter edge cases
+    can still be seen with `--show-noise` or pulled from the sender directly."""
+    sender = (from_addr or '').split('<')[0].strip().strip('"')[:40] or 'unknown'
+    clue_src = subject or fallback_label or 'blocked content'
+    g = Gist(
+        category='newsletter', intent='info',
+        frivolous=True, broadcast=True, obligation=False, critical=False,
+        sender=sender,
+        clue=str(clue_src)[:42] or 'blocked content',
+        error=None,
+    )
+    return g.model_dump_json()
+
+
 def describe_email(message_id: str, subject: str, body: str, model: str = MODEL_FLASH, quiet: bool = False, gist: bool = False, dry_run: bool = False, from_addr: str | None = None, thinking: str = "medium") -> str | None:
     text = build_email_text(from_addr, subject, body)
     if not text:
         return None
     content_hash = get_content_hash(text.encode())
     parts = [text]
-    return describe_document(content_hash, parts, subject or message_id, model=model, gist=gist, quiet=quiet, message_id=message_id, dry_run=dry_run, thinking=thinking)
+    try:
+        return describe_document(content_hash, parts, subject or message_id, model=model, gist=gist, quiet=quiet, message_id=message_id, dry_run=dry_run, thinking=thinking)
+    except PromptBlockedError as e:
+        if not gist:
+            raise  # non-gist flows (raw description) have no sensible fallback
+        if not quiet:
+            console.print(f"[dim yellow]{subject or message_id}: {e} — auto-classifying as newsletter noise[/dim yellow]")
+        desc_json = make_blocked_gist_json(from_addr, subject, message_id)
+        if not dry_run:
+            cache_key = f"{model}:gist:v3"
+            conn = sqlite3.connect(DB_FILE)
+            try:
+                save_description(conn, content_hash, desc_json, cache_key, message_id=message_id)
+            finally:
+                conn.close()
+        return desc_json
 
 
 def describe_document_task(args: dict) -> tuple[str, str | None, str | None]:
