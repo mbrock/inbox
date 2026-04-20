@@ -327,6 +327,83 @@ def convert_to_pdf(raw_path: Path) -> Path | None:
     return pdf_path if pdf_path.exists() else None
 
 
+# Gmail's batch endpoint accepts up to 100 sub-requests; 50 keeps the combined
+# response under a few MB when `format=full` bodies are large.
+BATCH_SIZE = 50
+
+
+def _batch_execute(service, requests):
+    """Run `requests` (list of (request_id, HttpRequest) tuples) through Gmail's
+    batch endpoint in chunks of BATCH_SIZE. Returns (results_by_id, errors_by_id).
+    """
+    results: dict[str, dict] = {}
+    errors: dict[str, Exception] = {}
+
+    def _cb(request_id, response, exception):
+        if exception is not None:
+            errors[request_id] = exception
+        else:
+            results[request_id] = response
+
+    for i in range(0, len(requests), BATCH_SIZE):
+        chunk = requests[i:i + BATCH_SIZE]
+        batch = service.new_batch_http_request(callback=_cb)
+        for rid, req in chunk:
+            batch.add(req, request_id=rid)
+        batch.execute()
+
+    return results, errors
+
+
+def _batch_get_messages(service, msg_ids):
+    reqs = [
+        (mid, service.users().messages().get(userId='me', id=mid, format='full'))
+        for mid in msg_ids
+    ]
+    return _batch_execute(service, reqs)
+
+
+def _batch_get_attachments(service, att_keys):
+    """att_keys: list of (key, message_id, attachment_id). Returns results_by_key."""
+    reqs = [
+        (
+            key,
+            service.users().messages().attachments().get(
+                userId='me', messageId=mid, id=aid,
+            ),
+        )
+        for key, mid, aid in att_keys
+    ]
+    return _batch_execute(service, reqs)
+
+
+def _save_attachment(conn, msg, att, raw_bytes):
+    """Persist a single decoded attachment. Returns a status dict matching the
+    shape that download_doc_attachments used to return."""
+    content_hash = hashlib.sha256(raw_bytes).hexdigest()
+
+    existing = conn.execute(
+        'SELECT local_path FROM attachments WHERE content_hash = ?',
+        (content_hash,)
+    ).fetchone()
+    if existing:
+        return {'filename': att['filename'], 'path': existing[0], 'status': 'exists'}
+
+    raw_path = generate_doc_path(msg, att['filename'])
+    raw_path.parent.mkdir(parents=True, exist_ok=True)
+    raw_path.write_bytes(raw_bytes)
+
+    pdf_path = convert_to_pdf(raw_path)
+    stored_path = pdf_path if pdf_path else raw_path
+
+    conn.execute('''
+        INSERT INTO attachments (message_id, filename, content_hash, size_bytes, local_path, downloaded_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+    ''', (msg['id'], att['filename'], content_hash, len(raw_bytes), str(stored_path), datetime.now().isoformat()))
+
+    return {'filename': att['filename'], 'path': str(stored_path), 'status': 'downloaded'}
+
+
 def download_doc_attachments(service, conn, msg):
     """Download PDF/XLS/XLSX/ODS attachments and store in database.
 
@@ -334,6 +411,8 @@ def download_doc_attachments(service, conn, msg):
     downstream Gemini pipeline (which expects application/pdf) works uniformly.
     The DB's local_path points at the PDF (converted or native); raw originals
     sit alongside.
+
+    Used by backfill (per-message); sync_messages uses the batched path below.
     """
     payload = msg.get('payload', {})
     attachments = extract_doc_attachments(payload)
@@ -350,31 +429,8 @@ def download_doc_attachments(service, conn, msg):
             messageId=msg_id,
             id=att['attachment_id']
         ).execute()
-
         data = base64.urlsafe_b64decode(att_data['data'])
-        content_hash = hashlib.sha256(data).hexdigest()
-
-        existing = conn.execute(
-            'SELECT local_path FROM attachments WHERE content_hash = ?',
-            (content_hash,)
-        ).fetchone()
-        if existing:
-            downloaded.append({'filename': att['filename'], 'path': existing[0], 'status': 'exists'})
-            continue
-
-        raw_path = generate_doc_path(msg, att['filename'])
-        raw_path.parent.mkdir(parents=True, exist_ok=True)
-        raw_path.write_bytes(data)
-
-        pdf_path = convert_to_pdf(raw_path)
-        stored_path = pdf_path if pdf_path else raw_path
-
-        conn.execute('''
-            INSERT INTO attachments (message_id, filename, content_hash, size_bytes, local_path, downloaded_at)
-            VALUES (?, ?, ?, ?, ?, ?)
-        ''', (msg_id, att['filename'], content_hash, len(data), str(stored_path), datetime.now().isoformat()))
-
-        downloaded.append({'filename': att['filename'], 'path': str(stored_path), 'status': 'downloaded'})
+        downloaded.append(_save_attachment(conn, msg, att, data))
 
     return downloaded
 
@@ -419,55 +475,88 @@ def sync_messages(service, conn, days=7, with_pdfs=True):
 
     new_count = 0
     att_count = 0
-    for i, msg_id in enumerate(new_ids):
-        msg = service.users().messages().get(userId='me', id=msg_id, format='full').execute()
-        payload = msg.get('payload', {})
-        headers = payload.get('headers', [])
+    processed = 0
+    for batch_start in range(0, len(new_ids), BATCH_SIZE):
+        chunk = new_ids[batch_start:batch_start + BATCH_SIZE]
+        msgs, msg_errs = _batch_get_messages(service, chunk)
+        for mid, exc in msg_errs.items():
+            print(f"  ! fetch failed for {mid}: {exc}", flush=True)
 
-        subject = get_header(headers, 'Subject')
-        from_addr = get_header(headers, 'From')
-        to_addr = get_header(headers, 'To')
-        date = get_header(headers, 'Date')
-
-        body_text, body_html = get_body_parts(payload)
-
-        try:
-            internal_date = int(parsedate_to_datetime(date).timestamp()) if date else None
-        except Exception:
-            internal_date = None
-
-        conn.execute('''
-            INSERT OR REPLACE INTO messages
-            (id, thread_id, label_ids, snippet, subject, from_addr, to_addr, date, body_text, body_html, raw_payload, synced_at, body_hash, internal_date)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (
-            msg_id,
-            msg.get('threadId'),
-            json.dumps(msg.get('labelIds', [])),
-            msg.get('snippet'),
-            subject,
-            from_addr,
-            to_addr,
-            date,
-            body_text,
-            body_html,
-            json.dumps(payload),
-            datetime.now().isoformat(),
-            compute_body_hash(subject, body_text),
-            internal_date,
-        ))
-
+        # Collect all attachment fetches for this chunk into one batch.
+        att_payloads = {}
         if with_pdfs:
-            downloaded = download_doc_attachments(service, conn, msg)
-            for d in downloaded:
-                status = "✓" if d['status'] == 'downloaded' else "○"
-                print(f"  {status} {d['filename']}")
-                if d['status'] == 'downloaded':
-                    att_count += 1
+            att_keys = []
+            att_meta = {}
+            for mid, msg in msgs.items():
+                for att in extract_doc_attachments(msg.get('payload', {})):
+                    key = f"{mid}:{att['attachment_id']}"
+                    att_keys.append((key, mid, att['attachment_id']))
+                    att_meta[key] = (mid, att)
+            if att_keys:
+                att_payloads, att_errs = _batch_get_attachments(service, att_keys)
+                for key, exc in att_errs.items():
+                    _, att = att_meta[key]
+                    print(f"  ! attachment fetch failed ({att['filename']}): {exc}", flush=True)
 
+        for mid in chunk:
+            processed += 1
+            if mid not in msgs:
+                continue
+            msg = msgs[mid]
+            payload = msg.get('payload', {})
+            headers = payload.get('headers', [])
+
+            subject = get_header(headers, 'Subject')
+            from_addr = get_header(headers, 'From')
+            to_addr = get_header(headers, 'To')
+            date = get_header(headers, 'Date')
+
+            body_text, body_html = get_body_parts(payload)
+
+            try:
+                internal_date = int(parsedate_to_datetime(date).timestamp()) if date else None
+            except Exception:
+                internal_date = None
+
+            conn.execute('''
+                INSERT OR REPLACE INTO messages
+                (id, thread_id, label_ids, snippet, subject, from_addr, to_addr, date, body_text, body_html, raw_payload, synced_at, body_hash, internal_date)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                mid,
+                msg.get('threadId'),
+                json.dumps(msg.get('labelIds', [])),
+                msg.get('snippet'),
+                subject,
+                from_addr,
+                to_addr,
+                date,
+                body_text,
+                body_html,
+                json.dumps(payload),
+                datetime.now().isoformat(),
+                compute_body_hash(subject, body_text),
+                internal_date,
+            ))
+
+            if with_pdfs:
+                for att in extract_doc_attachments(payload):
+                    key = f"{mid}:{att['attachment_id']}"
+                    resp = att_payloads.get(key)
+                    if not resp or 'data' not in resp:
+                        continue
+                    data = base64.urlsafe_b64decode(resp['data'])
+                    d = _save_attachment(conn, msg, att, data)
+                    status = "✓" if d['status'] == 'downloaded' else "○"
+                    print(f"  {status} {d['filename']}")
+                    if d['status'] == 'downloaded':
+                        att_count += 1
+
+            new_count += 1
+            print(f"  [{processed}/{len(new_ids)}] {subject[:50] if subject else '(no subject)'}", flush=True)
+
+        # One commit per batch instead of per message.
         conn.commit()
-        new_count += 1
-        print(f"  [{i + 1}/{len(new_ids)}] {subject[:50] if subject else '(no subject)'}", flush=True)
 
     pdf_total = conn.execute('SELECT COUNT(*) FROM attachments').fetchone()[0]
     print(f"Done! {new_count} new message(s), {att_count} new attachment(s). DB now holds {pdf_total} attachments.")
