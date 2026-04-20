@@ -172,6 +172,13 @@ load_dotenv(Path.home() / '.env')
 if os.environ.get('GEMINI_API_KEY') and os.environ.get('GOOGLE_API_KEY'):
     os.environ['GEMINI_API_KEY'] = ''
 
+
+def get_api_key() -> str | None:
+    """Read the Gemini API key. Accepts GOOGLE_API_KEY (preferred) or
+    GEMINI_API_KEY (what the older README asked for)."""
+    return os.environ.get('GOOGLE_API_KEY') or os.environ.get('GEMINI_API_KEY')
+
+
 console = Console()
 
 SCRIPT_DIR = Path(__file__).parent
@@ -277,10 +284,10 @@ def describe_document(
             conn.close()
             return cached
 
-    api_key = os.environ.get('GOOGLE_API_KEY')
+    api_key = get_api_key()
     if not api_key:
         if not quiet:
-            console.print("[red]No API key found. Set GOOGLE_API_KEY[/red]")
+            console.print("[red]No API key found. Set GOOGLE_API_KEY (or GEMINI_API_KEY)[/red]")
         conn.close()
         return None
 
@@ -607,6 +614,15 @@ def describe_documents_parallel(tasks: list[dict], workers: int = MAX_WORKERS, e
     results: list[tuple[dict, str | None]] = []
     error_count = 0
     gist = tasks[0]['gist'] if tasks else False
+
+    # Fail fast: without a key, every worker returns None silently (quiet=True
+    # suppresses the per-task error), so you'd otherwise see "N/N errors" with
+    # no indication why.
+    if tasks and not get_api_key():
+        raise SystemExit(
+            "No Gemini API key found. Set GOOGLE_API_KEY (or GEMINI_API_KEY) "
+            "in ~/.env and re-run."
+        )
 
     with Progress(
         SpinnerColumn(),
