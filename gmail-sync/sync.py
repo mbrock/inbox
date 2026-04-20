@@ -733,7 +733,11 @@ def get_message_by_search(conn, search_term: str):
 
 
 def describe_all_documents(conn, source='pdfs', model=None, parallel=False, workers=4, limit=None, gist=False, dry_run=False, thinking='medium', emoji=False, show_noise=False):
-    from extract import describe_pdf, describe_email, describe_documents_parallel, print_gist_row, print_gist_week, _week_bucket, build_id_shortener, MODEL_PRO
+    from extract import (
+        describe_pdf, describe_email, describe_document_task,
+        describe_documents_parallel, print_gist_row, print_gist_week,
+        _week_bucket, build_id_shortener, get_api_key, Gist, MODEL_PRO,
+    )
 
     if model is None:
         model = MODEL_PRO
@@ -826,30 +830,78 @@ def describe_all_documents(conn, source='pdfs', model=None, parallel=False, work
         rc = RichConsole()
 
         if gist:
-            # Compute a stable id-shortener across ALL messages in the DB so
-            # the short ID width is consistent across runs / across weeks.
+            # Stable id-shortener across ALL messages so the short ID width
+            # is consistent across runs / weeks.
             all_ids = [r[0] for r in conn.execute('SELECT id FROM messages').fetchall()]
             id_map = build_id_shortener(all_ids, safety=1)
 
-            # Process one week at a time: oldest week first, "this week" last,
-            # so each week's rows print together as they complete.
+            # One shared executor + one progress bar across every week, so the
+            # bar actually reflects total progress instead of restarting at 0%
+            # per bucket. Weeks are printed in display order (oldest first)
+            # as soon as both (a) all of that week's tasks have finished and
+            # (b) every older week has already been printed.
             from collections import defaultdict
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            from rich.progress import Progress, SpinnerColumn, BarColumn, TaskProgressColumn, TextColumn
+
+            if not get_api_key():
+                raise SystemExit(
+                    "No Gemini API key found. Set GOOGLE_API_KEY (or GEMINI_API_KEY) "
+                    "in ~/.env and re-run."
+                )
+
             buckets: dict[tuple[int, str], list[dict]] = defaultdict(list)
             for t in tasks:
                 week_idx, week_label = _week_bucket(t.get('date', ''))
                 buckets[(week_idx, week_label)].append(t)
 
-            for (week_idx, week_label) in sorted(buckets.keys(), reverse=True):
-                week_tasks = buckets[(week_idx, week_label)]
-                results, errs = describe_documents_parallel(week_tasks, workers=workers, emoji=emoji)
-                error_count += errs
-                if not dry_run:
-                    for task, description in results:
-                        if description and task['type'] == 'pdf':
-                            suffix = '.gist.txt'
-                            txt_path = Path(task['path']).with_name(Path(task['path']).stem + suffix)
-                            txt_path.write_text(description, encoding='utf-8')
-                print_gist_week(rc, week_label, results, emoji=emoji, show_noise=show_noise, id_map=id_map)
+            week_order = sorted(buckets.keys(), reverse=True)  # oldest first
+            remaining = {wk: len(ts) for wk, ts in buckets.items()}
+            completed: dict[tuple[int, str], list[tuple[dict, str | None]]] = defaultdict(list)
+            print_cursor = 0  # index into week_order of the next week to print
+
+            def _maybe_drain_weeks():
+                nonlocal print_cursor
+                while print_cursor < len(week_order) and remaining[week_order[print_cursor]] == 0:
+                    wk = week_order[print_cursor]
+                    print_gist_week(rc, wk[1], completed[wk], emoji=emoji,
+                                    show_noise=show_noise, id_map=id_map)
+                    print_cursor += 1
+
+            with Progress(
+                SpinnerColumn(), BarColumn(), TaskProgressColumn(),
+                TextColumn("{task.completed}/{task.total}"),
+                console=rc, transient=True,
+            ) as progress:
+                ptask = progress.add_task("", total=len(tasks))
+                with ThreadPoolExecutor(max_workers=workers) as executor:
+                    future_info: dict = {}
+                    for wk, wts in buckets.items():
+                        for t in wts:
+                            fut = executor.submit(describe_document_task, t)
+                            future_info[fut] = (wk, t)
+                    for fut in as_completed(future_info):
+                        wk, task = future_info[fut]
+                        _, description, error = fut.result()
+                        if error or not description:
+                            error_count += 1
+                        else:
+                            try:
+                                if Gist.model_validate_json(description).error:
+                                    error_count += 1
+                            except Exception:
+                                error_count += 1
+                            if not dry_run and task['type'] == 'pdf':
+                                txt_path = Path(task['path']).with_name(
+                                    Path(task['path']).stem + '.gist.txt')
+                                txt_path.write_text(description, encoding='utf-8')
+                        completed[wk].append((task, description))
+                        remaining[wk] -= 1
+                        progress.advance(ptask)
+                        _maybe_drain_weeks()
+
+            # Anything still unprinted (e.g. empty buckets) — flush.
+            _maybe_drain_weeks()
         else:
             results, error_count = describe_documents_parallel(tasks, workers=workers, emoji=emoji)
             if not dry_run:
