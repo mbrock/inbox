@@ -5,14 +5,14 @@
 .env
 .envrc
 secret/
-gmail-sync/credentials.json
-gmail-sync/token.json
+credentials.json
+token.json
 
 # Local DB + downloaded attachments
-gmail-sync/gmail.db
-gmail-sync/gmail.db-journal
-gmail-sync/gmail.db-wal
-gmail-sync/gmail.db-shm
+gmail.db
+gmail.db-journal
+gmail.db-wal
+gmail.db-shm
 pdf/
 
 # Python

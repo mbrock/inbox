@@ -10,17 +10,12 @@ category × intent × four triage flags), prints a week-by-week priority view.
 - `libreoffice` (`brew install --cask libreoffice` / `apt install libreoffice`)
   — used to convert `.xls`/`.xlsx` attachments to PDF so Gemini can read them.
 - `GOOGLE_API_KEY` in the environment (Gemini API key).
-- `gmail-sync/credentials.json` — OAuth desktop-app credentials from
-  Google Cloud Console (Gmail API enabled). First run authorizes and writes
-  `gmail-sync/token.json`.
+- `credentials.json` — OAuth desktop-app credentials from Google Cloud
+  Console (Gmail API enabled). First run authorizes and writes `token.json`.
 
 ## Common commands
 
-All commands run from `gmail-sync/`:
-
 ```bash
-cd gmail-sync
-
 uv run sync.py sync                   # fetch new mail + classify (flash-lite, parallel, all sources)
 uv run sync.py sync --days 14 --pro   # deeper window + upgrade to Gemini 3 Pro
 uv run sync.py sync --no-analyze      # fetch only, skip the classifier
@@ -36,18 +31,18 @@ uv run sync.py backfill               # rescan synced messages for PDFs/XLSs
 
 ## Layout
 
-- `gmail-sync/sync.py` — click CLI. Gmail API fetch, SQLite writes, attachment
+- `sync.py` — click CLI. Gmail API fetch, SQLite writes, attachment
   downloads (PDF + XLS + XLSX + ODS, non-PDFs auto-converted via `soffice`),
   and the triage subcommands (`list`, `search`, `reply`, …).
-- `gmail-sync/extract.py` — Gemini call, `Gist` schema, renderer.
-- `gmail-sync/gmail.db` — SQLite (ignored). Tables: `messages`,
-  `attachments`, `invoice_extractions` (the gist cache).
+- `extract.py` — Gemini call, `Gist` schema, renderer.
+- `gmail.db` — SQLite (ignored). Tables: `messages`, `attachments`,
+  `invoice_extractions` (the gist cache).
 
 ## Data that lives outside git
 
 Copy these from an existing install:
 
-- `gmail-sync/gmail.db` (cached messages + gists)
-- `gmail-sync/credentials.json` (OAuth app)
-- `gmail-sync/token.json` (OAuth user)
+- `gmail.db` (cached messages + gists)
+- `credentials.json` (OAuth app)
+- `token.json` (OAuth user)
 - `~/pdf/` (downloaded attachments; optional — can re-sync)
