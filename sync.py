@@ -752,11 +752,29 @@ def get_message_by_search(conn, search_term: str):
     return None
 
 
-def describe_all_documents(conn, source='pdfs', model=None, parallel=False, workers=4, limit=None, gist=False, dry_run=False, thinking='medium', emoji=False, show_noise=False):
+def describe_all_documents(conn, source='pdfs', model=None, parallel=False, workers=4, limit=None, gist=False, dry_run=False, thinking='medium', emoji=False, show_noise=False, force=False, retry_failed=False):
+    """
+    `gist` paths treat "already analyzed" as model-agnostic: once ANY model
+    has produced a `:gist:v3` row for a message, the message is skipped on
+    future runs. This means `analyze --pro` after a flash-lite pass will
+    only do the handful of messages that nobody has successfully analyzed
+    yet — not re-do the whole inbox.
+
+    Opt-outs:
+      --force         : bypass the "already analyzed" filter entirely
+                        (classify everything under the currently selected
+                        model, re-doing cached rows).
+      --retry-failed  : include only messages whose cached gist rows ALL
+                        have `.error` set (i.e. every prior attempt was a
+                        classifier failure, typically a prompt safety block).
+                        Useful for re-trying those with a different model:
+                        `analyze --retry-failed --pro`.
+    """
     from extract import (
         describe_pdf, describe_email, describe_document_task,
         describe_documents_parallel, print_gist_row, print_gist_week,
         _week_bucket, build_id_shortener, get_api_key, Gist, MODEL_PRO,
+        make_error_gist_json, task_content_hash,
     )
 
     if model is None:
@@ -765,18 +783,85 @@ def describe_all_documents(conn, source='pdfs', model=None, parallel=False, work
     cache_key = f"{model}:gist:v3" if gist else model
     tasks = []
 
+    # --- filter clauses --------------------------------------------------
+    # For the non-gist path we keep the old per-model semantics (it's used
+    # by bulk PDF description, not triage). For the gist path we match any
+    # `%:gist:v3` row because that's what the user means by "analyzed".
+    gist_row_pattern = "%:gist:v3" if gist else cache_key
+
+    def msg_filter_clause() -> tuple[str, tuple]:
+        if force:
+            return "", ()
+        if retry_failed:
+            # at least one error row and zero success rows
+            clause = """
+                AND EXISTS (
+                    SELECT 1 FROM invoice_extractions e1
+                    WHERE e1.model_name LIKE ?
+                      AND (e1.message_id = m.id OR (m.body_hash IS NOT NULL AND e1.content_hash = m.body_hash))
+                      AND json_extract(e1.extracted_json, '$.error') IS NOT NULL
+                )
+                AND NOT EXISTS (
+                    SELECT 1 FROM invoice_extractions e2
+                    WHERE e2.model_name LIKE ?
+                      AND (e2.message_id = m.id OR (m.body_hash IS NOT NULL AND e2.content_hash = m.body_hash))
+                      AND json_extract(e2.extracted_json, '$.error') IS NULL
+                )
+            """
+            return clause, (gist_row_pattern, gist_row_pattern)
+        if dry_run:
+            return "", ()
+        clause = """
+            AND NOT EXISTS (
+                SELECT 1 FROM invoice_extractions e
+                WHERE e.model_name LIKE ?
+                  AND (e.message_id = m.id OR (m.body_hash IS NOT NULL AND e.content_hash = m.body_hash))
+            )
+        """
+        return clause, (gist_row_pattern,)
+
+    def pdf_filter_clause() -> tuple[str, tuple]:
+        if force:
+            return "", ()
+        # Attachments don't have a message-level body_hash; match by
+        # a.content_hash only.
+        if retry_failed:
+            clause = """
+                AND EXISTS (
+                    SELECT 1 FROM invoice_extractions e1
+                    WHERE e1.model_name LIKE ? AND e1.content_hash = a.content_hash
+                      AND json_extract(e1.extracted_json, '$.error') IS NOT NULL
+                )
+                AND NOT EXISTS (
+                    SELECT 1 FROM invoice_extractions e2
+                    WHERE e2.model_name LIKE ? AND e2.content_hash = a.content_hash
+                      AND json_extract(e2.extracted_json, '$.error') IS NULL
+                )
+            """
+            return clause, (gist_row_pattern, gist_row_pattern)
+        if dry_run:
+            return "", ()
+        clause = """
+            AND NOT EXISTS (
+                SELECT 1 FROM invoice_extractions e
+                WHERE e.model_name LIKE ? AND e.content_hash = a.content_hash
+            )
+        """
+        return clause, (gist_row_pattern,)
+
     if source in ('pdfs', 'all'):
-        pdf_query = '''
+        pdf_filter, pdf_params = pdf_filter_clause()
+        pdf_query = f'''
             SELECT a.local_path, a.content_hash, a.filename, m.date, m.from_addr
             FROM attachments a
             JOIN messages m ON a.message_id = m.id
-            LEFT JOIN invoice_extractions e ON a.content_hash = e.content_hash AND e.model_name = ?
-            WHERE e.id IS NULL
+            WHERE 1=1
+              {pdf_filter}
             ORDER BY COALESCE(m.internal_date, 0) DESC
         '''
         if limit and source == 'pdfs':
             pdf_query += f' LIMIT {limit}'
-        for path, _, filename, date, from_addr in conn.execute(pdf_query, (cache_key,)).fetchall():
+        for path, _, filename, date, from_addr in conn.execute(pdf_query, pdf_params).fetchall():
             if Path(path).exists():
                 tasks.append({'type': 'pdf', 'path': path, 'label': filename, 'model': model,
                               'gist': gist, 'date': date, 'sender': from_addr or '', 'dry_run': dry_run,
@@ -786,9 +871,6 @@ def describe_all_documents(conn, source='pdfs', model=None, parallel=False, work
         # Dedupe by body_hash so identical emails (e.g. repeated FLY.IO payment
         # failures) aren't re-analyzed. A cached row for ANY prior sibling with
         # the same hash counts as "already analyzed" for this message too.
-        #
-        # In --dry-run we bypass both filters so you see results on real recent
-        # traffic even if it's already been gisted.
         # Skip outgoing mail (messages I sent) — not useful to triage my own stuff.
         # Accept HTML-only messages too — many automated senders (Tuul, Revolut,
         # AWS) omit text/plain. We'll fall back to body_html → snippet below.
@@ -796,31 +878,18 @@ def describe_all_documents(conn, source='pdfs', model=None, parallel=False, work
         HAS_BODY = (
             "(COALESCE(NULLIF(m.body_text,''), NULLIF(m.body_html,''), NULLIF(m.snippet,'')) IS NOT NULL)"
         )
-        if dry_run:
-            email_query = f'''
-                SELECT m.id, m.subject, m.from_addr, m.body_text, m.body_html, m.snippet, m.date
-                FROM messages m
-                WHERE {HAS_BODY}
-                  {SENT_FILTER}
-                ORDER BY COALESCE(m.internal_date, 0) DESC
-            '''
-        else:
-            email_query = f'''
-                SELECT m.id, m.subject, m.from_addr, m.body_text, m.body_html, m.snippet, m.date
-                FROM messages m
-                WHERE {HAS_BODY}
-                  {SENT_FILTER}
-                  AND NOT EXISTS (
-                        SELECT 1 FROM invoice_extractions e
-                        WHERE e.model_name = ?
-                          AND (e.message_id = m.id OR (m.body_hash IS NOT NULL AND e.content_hash = m.body_hash))
-                  )
-                ORDER BY COALESCE(m.internal_date, 0) DESC
-            '''
+        msg_filter, msg_params = msg_filter_clause()
+        email_query = f'''
+            SELECT m.id, m.subject, m.from_addr, m.body_text, m.body_html, m.snippet, m.date
+            FROM messages m
+            WHERE {HAS_BODY}
+              {SENT_FILTER}
+              {msg_filter}
+            ORDER BY COALESCE(m.internal_date, 0) DESC
+        '''
         if limit and source == 'emails':
             email_query += f' LIMIT {limit}'
-        params = () if dry_run else (cache_key,)
-        for msg_id, subject, from_addr, body_text, body_html, snippet, date in conn.execute(email_query, params).fetchall():
+        for msg_id, subject, from_addr, body_text, body_html, snippet, date in conn.execute(email_query, msg_params).fetchall():
             body = body_text or body_html or snippet or ''
             tasks.append({
                 'type': 'email',
@@ -905,6 +974,24 @@ def describe_all_documents(conn, source='pdfs', model=None, parallel=False, work
                         _, description, error = fut.result()
                         if error or not description:
                             error_count += 1
+                            # Cache the failure as an error-Gist row so the
+                            # default analyze filter skips it next run. Without
+                            # this, prompt-block failures (PROHIBITED_CONTENT
+                            # etc.) stay "unanalyzed" forever and burn retries
+                            # every time. `--retry-failed` surfaces them back.
+                            if not dry_run:
+                                ch = task_content_hash(task)
+                                if ch:
+                                    err_json = make_error_gist_json(error or "no response", task)
+                                    conn.execute(
+                                        'INSERT OR REPLACE INTO invoice_extractions '
+                                        '(content_hash, model_name, extracted_json, created_at, message_id) '
+                                        'VALUES (?, ?, ?, ?, ?)',
+                                        (ch, cache_key, err_json,
+                                         datetime.now().isoformat(),
+                                         task.get('message_id')),
+                                    )
+                                    conn.commit()
                         else:
                             try:
                                 if Gist.model_validate_json(description).error:
@@ -1057,7 +1144,9 @@ def cli():
 @click.option("--emoji/--no-emoji", default=True, show_default=True)
 @click.option("--show-noise", is_flag=True, help="Include bulk/frivolous rows")
 @click.option("--limit", type=int, default=None, help="Cap analysis at N tasks, newest first")
-def cmd_sync(days, analyze, gist, parallel, workers, source, pro, flash, pdfs, thinking, emoji, show_noise, limit):
+@click.option("--force", is_flag=True, help="Re-analyze even if already gist-classified (any model)")
+@click.option("--retry-failed", is_flag=True, help="Only re-analyze messages whose prior attempts all errored")
+def cmd_sync(days, analyze, gist, parallel, workers, source, pro, flash, pdfs, thinking, emoji, show_noise, limit, force, retry_failed):
     """Fetch new mail, download attachments, classify."""
     model = _resolve_model(pro, flash)
     service = get_gmail_service()
@@ -1067,7 +1156,8 @@ def cmd_sync(days, analyze, gist, parallel, workers, source, pro, flash, pdfs, t
         print(f"\nAnalyzing {source}...\n")
         describe_all_documents(conn, source=source, model=model, parallel=parallel,
                                workers=workers, limit=limit, gist=gist, thinking=thinking,
-                               emoji=emoji, show_noise=show_noise)
+                               emoji=emoji, show_noise=show_noise,
+                               force=force, retry_failed=retry_failed)
     conn.close()
 
 
@@ -1083,14 +1173,27 @@ def cmd_sync(days, analyze, gist, parallel, workers, source, pro, flash, pdfs, t
 @click.option("--show-noise", is_flag=True)
 @click.option("--limit", type=int, default=None)
 @click.option("--dry-run", is_flag=True, help="Skip DB reads/writes; preview on real samples")
-def cmd_analyze(source, gist, parallel, workers, pro, flash, thinking, emoji, show_noise, limit, dry_run):
-    """Run the classifier over uncached messages/PDFs."""
+@click.option("--force", is_flag=True, help="Re-analyze even if already gist-classified (any model)")
+@click.option("--retry-failed", is_flag=True, help="Only re-analyze messages whose prior attempts all errored")
+def cmd_analyze(source, gist, parallel, workers, pro, flash, thinking, emoji, show_noise, limit, dry_run, force, retry_failed):
+    """Run the classifier over uncached messages/PDFs.
+
+    By default, any message (or attachment) that already has a `:gist:v3`
+    row — from any model — is skipped. This means `analyze --pro` after a
+    flash-lite pass only targets the handful of messages nobody has
+    classified yet (including prior hard failures cached as error rows).
+
+    `--force` reclassifies everything under the current model (--pro etc).
+    `--retry-failed` picks just the messages whose prior attempts all
+    errored out, so `analyze --retry-failed --pro` retries those on Pro.
+    """
     model = _resolve_model(pro, flash)
     conn = init_db()
     errs = describe_all_documents(
         conn, source=source, model=model, parallel=parallel, workers=workers,
         limit=limit, gist=gist, dry_run=dry_run, thinking=thinking,
         emoji=emoji, show_noise=show_noise,
+        force=force, retry_failed=retry_failed,
     ) or 0
     conn.close()
     if errs:

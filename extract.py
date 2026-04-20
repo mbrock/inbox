@@ -409,6 +409,41 @@ def email_content_hash(from_addr: str | None, subject: str | None, body: str | N
     return get_content_hash(text.encode())
 
 
+def task_content_hash(task: dict) -> str | None:
+    """content_hash that describe_{email,pdf} would use as its cache key."""
+    if task.get('type') == 'pdf':
+        path = task.get('path')
+        if not path or not Path(path).exists():
+            return None
+        return get_content_hash(Path(path).read_bytes())
+    return email_content_hash(
+        task.get('sender') or None,
+        task.get('subject') or None,
+        task.get('body') or None,
+    )
+
+
+def make_error_gist_json(error_msg: str, task: dict) -> str:
+    """Synthesize a Gist JSON blob with `error` set so a classifier failure
+    can be cached in `invoice_extractions` and picked up by `--retry-failed`
+    without silently re-burning tokens on every `analyze` run.
+
+    The required non-error fields are filled with inert defaults (broadcast
+    noise in the `other` category) so that if a stray renderer ever reads
+    the row without honoring `.error`, it shows up as muted, not as a
+    fake-confident classification."""
+    sender = (task.get('sender') or '').split('<')[0].strip().strip('"')[:40] or 'unknown'
+    label = task.get('label') or task.get('subject') or task.get('message_id') or 'n/a'
+    g = Gist(
+        category='other', intent='info',
+        frivolous=True, broadcast=False, obligation=False, critical=False,
+        sender=sender,
+        clue=str(label)[:42] or 'n/a',
+        error=error_msg[:500],
+    )
+    return g.model_dump_json()
+
+
 def describe_email(message_id: str, subject: str, body: str, model: str = MODEL_FLASH, quiet: bool = False, gist: bool = False, dry_run: bool = False, from_addr: str | None = None, thinking: str = "medium") -> str | None:
     text = build_email_text(from_addr, subject, body)
     if not text:
