@@ -582,7 +582,7 @@ def get_message_by_search(conn, search_term: str):
 
 
 def describe_all_documents(conn, source='pdfs', model=None, parallel=False, workers=4, limit=None, gist=False, dry_run=False, thinking='medium', emoji=False, show_noise=False):
-    from extract import describe_pdf, describe_email, describe_documents_parallel, print_gist_row, print_gist_week, _week_bucket, MODEL_PRO
+    from extract import describe_pdf, describe_email, describe_documents_parallel, print_gist_row, print_gist_week, _week_bucket, build_id_shortener, MODEL_PRO
 
     if model is None:
         model = MODEL_PRO
@@ -675,6 +675,11 @@ def describe_all_documents(conn, source='pdfs', model=None, parallel=False, work
         rc = RichConsole()
 
         if gist:
+            # Compute a stable id-shortener across ALL messages in the DB so
+            # the short ID width is consistent across runs / across weeks.
+            all_ids = [r[0] for r in conn.execute('SELECT id FROM messages').fetchall()]
+            id_map = build_id_shortener(all_ids, safety=1)
+
             # Process one week at a time: oldest week first, "this week" last,
             # so each week's rows print together as they complete.
             from collections import defaultdict
@@ -683,7 +688,6 @@ def describe_all_documents(conn, source='pdfs', model=None, parallel=False, work
                 week_idx, week_label = _week_bucket(t.get('date', ''))
                 buckets[(week_idx, week_label)].append(t)
 
-            # Oldest week first (highest index), current week last.
             for (week_idx, week_label) in sorted(buckets.keys(), reverse=True):
                 week_tasks = buckets[(week_idx, week_label)]
                 results, errs = describe_documents_parallel(week_tasks, workers=workers, emoji=emoji)
@@ -694,7 +698,7 @@ def describe_all_documents(conn, source='pdfs', model=None, parallel=False, work
                             suffix = '.gist.txt'
                             txt_path = Path(task['path']).with_name(Path(task['path']).stem + suffix)
                             txt_path.write_text(description, encoding='utf-8')
-                print_gist_week(rc, week_label, results, emoji=emoji, show_noise=show_noise)
+                print_gist_week(rc, week_label, results, emoji=emoji, show_noise=show_noise, id_map=id_map)
         else:
             results, error_count = describe_documents_parallel(tasks, workers=workers, emoji=emoji)
             if not dry_run:
@@ -954,7 +958,7 @@ def main():
     elif cmd == 'gists':
         # Print all cached v3-schema gists, week-by-week, same layout as the
         # live `analyze --gist` run.
-        from extract import print_gist_week, _week_bucket
+        from extract import print_gist_week, _week_bucket, build_id_shortener
         from rich.console import Console as RichConsole
         from collections import defaultdict
         rc = RichConsole()
@@ -976,11 +980,15 @@ def main():
             JOIN messages m ON e.message_id = m.id
             WHERE e.model_name LIKE '%:gist:v3'
         ''').fetchall()
-        conn.close()
 
         if not rows:
             print("No structured gists cached yet. Run: uv run sync.py analyze --emails --gist")
+            conn.close()
             return
+
+        all_ids = [r[0] for r in conn.execute('SELECT id FROM messages').fetchall()]
+        id_map = build_id_shortener(all_ids, safety=1)
+        conn.close()
 
         buckets: dict = defaultdict(list)
         for date_str, from_addr, description, msg_id in rows:
@@ -995,7 +1003,7 @@ def main():
         printed = 0
         for (week_idx, week_label) in sorted(buckets.keys(), reverse=True):
             printed += print_gist_week(rc, week_label, buckets[(week_idx, week_label)],
-                                       emoji=emoji, show_noise=show_noise)
+                                       emoji=emoji, show_noise=show_noise, id_map=id_map)
         if not printed:
             print("Nothing matches.")
 

@@ -464,6 +464,27 @@ def _format_money(amount: float, currency: str | None) -> str:
     return f"{n} {cur}" if cur else str(n)
 
 
+def _base32_hash(mid: str) -> str:
+    """Lowercase base32 of sha256(msg_id) with trailing '=' stripped."""
+    import base64
+    return base64.b32encode(hashlib.sha256(mid.encode()).digest()).decode("ascii").lower().rstrip("=")
+
+
+def build_id_shortener(all_ids, safety: int = 1) -> dict:
+    """Given an iterable of Gmail message IDs, return {full_id → short_id}
+    using the shortest base32(sha256) prefix that is collision-free across
+    the input set, plus `safety` extra chars as headroom for future growth."""
+    hashes = {mid: _base32_hash(mid) for mid in all_ids if mid}
+    n = 4
+    while n < 52:
+        shorts = {h[:n] for h in hashes.values()}
+        if len(shorts) == len(hashes):
+            break
+        n += 1
+    n = min(52, n + safety)
+    return {mid: h[:n] for mid, h in hashes.items()}
+
+
 def _short_date(s: str) -> str:
     """Current-year dates render as 'Mon Apr 20'; other years as '2025-04-16'."""
     from email.utils import parsedate_to_datetime
@@ -506,7 +527,7 @@ def _relative_due(due_str: str | None) -> str:
     return f"due in {delta} days"
 
 
-def print_gist_row(console_, raw: str | None, *, date: str = "", sender: str = "", label: str = "", msg_id: str = "", emoji: bool = False) -> bool:
+def print_gist_row(console_, raw: str | None, *, date: str = "", sender: str = "", label: str = "", msg_id: str = "", id_map: dict | None = None, emoji: bool = False) -> bool:
     """Returns True if this row was an error (no response or `error` field set)."""
     """Render one gist result (structured JSON or legacy free text) as two aligned lines.
 
@@ -559,7 +580,12 @@ def print_gist_row(console_, raw: str | None, *, date: str = "", sender: str = "
     sender_pad = (sender_disp.rstrip()[:20]).ljust(20)
     stripe = f"[{stripe_style}] [/]" if stripe_style else " "
     date_pad = date_s.ljust(10)
-    short_id = (msg_id or "")[:8] if msg_id else " " * 8
+    if id_map and msg_id in id_map:
+        short_id = id_map[msg_id]
+    elif msg_id:
+        short_id = _base32_hash(msg_id)[:7]
+    else:
+        short_id = "       "
     body = f"[bold]{sender_pad}[/bold]  {meta_inline}{g.clue or ''}"
     kwargs = {"no_wrap": True, "overflow": "ellipsis"}
     if group <= 1:
@@ -639,7 +665,7 @@ def _week_bucket(s: str) -> tuple[int, str]:
     return (weeks, f"{months} month" + ("s" if months != 1 else "") + " ago")
 
 
-def print_gist_week(console_, week_label: str, results: list[tuple[dict, str | None]], *, emoji: bool = False, show_noise: bool = False) -> int:
+def print_gist_week(console_, week_label: str, results: list[tuple[dict, str | None]], *, emoji: bool = False, show_noise: bool = False, id_map: dict | None = None) -> int:
     """Print a single week's rows, already sorted priority→sender→date.
     Returns number of rows printed."""
     rows: list[tuple[int, str, str, dict, str]] = []
@@ -670,6 +696,7 @@ def print_gist_week(console_, week_label: str, results: list[tuple[dict, str | N
             sender=task.get('sender', ''),
             label=task.get('label', ''),
             msg_id=task.get('message_id') or task.get('msg_id') or '',
+            id_map=id_map,
             emoji=emoji,
         )
     return len(rows)
