@@ -573,7 +573,9 @@ def backfill_attachments(service, conn, days=7):
         (since, since)
     ).fetchall()
 
-    new_att = 0
+    # First pass: walk stored payloads and build a flat list of attachments that
+    # still need bytes. Second pass: one batched fetch for everything.
+    pending = []  # list of (key, msg_stub, att)
     for msg_id, raw in rows:
         try:
             payload = json.loads(raw) if raw else {}
@@ -592,13 +594,31 @@ def backfill_attachments(service, conn, days=7):
             continue
         # Fake a minimal msg dict for generate_doc_path (needs headers + id)
         msg_stub = {'id': msg_id, 'payload': payload}
-        downloaded = download_doc_attachments(service, conn, msg_stub)
-        for d in downloaded:
-            status = "✓" if d['status'] == 'downloaded' else "○"
-            print(f"  backfill {status} {d['filename']}")
-            if d['status'] == 'downloaded':
-                new_att += 1
-        conn.commit()
+        for att in atts:
+            key = f"{msg_id}:{att['attachment_id']}"
+            pending.append((key, msg_stub, att))
+
+    if not pending:
+        return 0
+
+    att_keys = [(key, stub['id'], att['attachment_id']) for key, stub, att in pending]
+    results, errs = _batch_get_attachments(service, att_keys)
+    for key, exc in errs.items():
+        print(f"  ! backfill fetch failed ({key}): {exc}", flush=True)
+
+    new_att = 0
+    for key, stub, att in pending:
+        resp = results.get(key)
+        if not resp or 'data' not in resp:
+            continue
+        data = base64.urlsafe_b64decode(resp['data'])
+        d = _save_attachment(conn, stub, att, data)
+        status = "✓" if d['status'] == 'downloaded' else "○"
+        print(f"  backfill {status} {d['filename']}")
+        if d['status'] == 'downloaded':
+            new_att += 1
+
+    conn.commit()
     return new_att
 
 
