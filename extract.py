@@ -921,19 +921,30 @@ def main(args: list[str] | None = None):
     use_pro = '--pro' in args
     use_cache = '--no-cache' not in args
     parallel = '--parallel' in args
+    show_all = '--all' in args
     model = MODEL_PRO if use_pro else MODEL_FLASH
 
-    # Parse --workers N
+    # Parse --workers N while preserving positional args.
     workers = MAX_WORKERS
-    for i, arg in enumerate(args):
+    cleaned_args: list[str] = []
+    i = 0
+    while i < len(args):
+        arg = args[i]
         if arg == '--workers' and i + 1 < len(args):
             try:
                 workers = int(args[i + 1])
+                i += 2
+                continue
             except ValueError:
-                pass
-
-    # Remove flags from args
-    args = [a for a in args if a not in ('--pro', '--no-cache', '--all', '--parallel') and not a.startswith('--workers')]
+                cleaned_args.append(arg)
+                i += 1
+                continue
+        if arg in ('--pro', '--no-cache', '--all', '--parallel'):
+            i += 1
+            continue
+        cleaned_args.append(arg)
+        i += 1
+    args = cleaned_args
 
     if not args:
         # Process unprocessed PDFs from database
@@ -972,7 +983,7 @@ def main(args: list[str] | None = None):
                     display_description(description, filename)
                     console.print()
 
-    elif '--all' in sys.argv:
+    elif show_all:
         # Process all PDFs (re-describe)
         conn = sqlite3.connect(DB_FILE)
         rows = conn.execute('SELECT local_path, filename FROM attachments ORDER BY downloaded_at DESC').fetchall()

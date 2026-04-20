@@ -13,7 +13,7 @@ import subprocess
 from datetime import datetime, timedelta
 from pathlib import Path
 from email.mime.text import MIMEText
-from email.utils import parsedate_to_datetime
+from email.utils import parsedate_to_datetime, parseaddr
 
 from email.utils import parsedate
 
@@ -97,6 +97,27 @@ def _backfill_internal_dates(conn):
     conn.commit()
 
 
+def _backfill_message_header_ids(conn):
+    rows = conn.execute(
+        "SELECT id, raw_payload FROM messages WHERE message_header_id IS NULL AND raw_payload IS NOT NULL AND raw_payload != ''"
+    ).fetchall()
+    if not rows:
+        return
+    for mid, raw_payload in rows:
+        try:
+            payload = json.loads(raw_payload)
+        except (TypeError, ValueError):
+            continue
+        headers = payload.get('headers', [])
+        message_header_id = get_header(headers, 'Message-ID')
+        if message_header_id:
+            conn.execute(
+                'UPDATE messages SET message_header_id = ? WHERE id = ?',
+                (message_header_id, mid),
+            )
+    conn.commit()
+
+
 def _backfill_body_hashes(conn):
     rows = conn.execute('''
         SELECT id, subject, from_addr, body_text, body_html, snippet
@@ -126,6 +147,7 @@ def init_db():
             subject TEXT,
             from_addr TEXT,
             to_addr TEXT,
+            message_header_id TEXT,
             date TEXT,
             body_text TEXT,
             body_html TEXT,
@@ -141,6 +163,7 @@ def init_db():
         CREATE TABLE IF NOT EXISTS attachments (
             id INTEGER PRIMARY KEY,
             message_id TEXT NOT NULL,
+            gmail_attachment_id TEXT,
             filename TEXT NOT NULL,
             content_hash TEXT NOT NULL,
             size_bytes INTEGER,
@@ -191,9 +214,12 @@ def init_db():
     # exactly so the analyze-side NOT EXISTS filter actually catches cached
     # rows; otherwise every run re-enqueues 600+ cache hits.
     msg_cols = [r[1] for r in conn.execute("PRAGMA table_info(messages)").fetchall()]
+    if 'message_header_id' not in msg_cols:
+        conn.execute('ALTER TABLE messages ADD COLUMN message_header_id TEXT')
     if 'body_hash' not in msg_cols:
         conn.execute('ALTER TABLE messages ADD COLUMN body_hash TEXT')
     conn.execute('CREATE INDEX IF NOT EXISTS idx_messages_body_hash ON messages(body_hash)')
+    _backfill_message_header_ids(conn)
 
     # One-shot migration: the old body_hash formula was "Subject: …\n\nbody"
     # (no From header, no truncation marker, body_text only). That never
@@ -212,6 +238,10 @@ def init_db():
         conn.execute('ALTER TABLE messages ADD COLUMN internal_date INTEGER')
     conn.execute('CREATE INDEX IF NOT EXISTS idx_messages_internal_date ON messages(internal_date)')
     _backfill_internal_dates(conn)
+
+    att_cols = [r[1] for r in conn.execute("PRAGMA table_info(attachments)").fetchall()]
+    if 'gmail_attachment_id' not in att_cols:
+        conn.execute('ALTER TABLE attachments ADD COLUMN gmail_attachment_id TEXT')
 
     conn.commit()
     return conn
@@ -439,29 +469,98 @@ def _batch_get_attachments(service, att_keys):
     return _batch_execute(service, reqs)
 
 
+def _attachment_local_path_ready(local_path: str | None) -> bool:
+    return bool(local_path) and Path(local_path).suffix.lower() == '.pdf' and Path(local_path).exists()
+
+
+def _attachment_row_for_message(conn, message_id: str, gmail_attachment_id: str | None):
+    if not gmail_attachment_id:
+        return None
+    return conn.execute(
+        'SELECT id, local_path FROM attachments WHERE message_id = ? AND gmail_attachment_id = ?',
+        (message_id, gmail_attachment_id),
+    ).fetchone()
+
+
+def _best_cached_attachment_path(conn, content_hash: str) -> str | None:
+    rows = conn.execute(
+        'SELECT local_path FROM attachments WHERE content_hash = ? AND local_path IS NOT NULL',
+        (content_hash,),
+    ).fetchall()
+    for (local_path,) in rows:
+        if _attachment_local_path_ready(local_path):
+            return local_path
+    return None
+
+
+def _insert_attachment_row(conn, msg, att, content_hash: str, size_bytes: int, local_path: str) -> None:
+    conn.execute('''
+        INSERT INTO attachments (message_id, gmail_attachment_id, filename, content_hash, size_bytes, local_path, downloaded_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    ''', (
+        msg['id'],
+        att.get('attachment_id'),
+        att['filename'],
+        content_hash,
+        size_bytes,
+        local_path,
+        datetime.now().isoformat(),
+    ))
+
+
+def _update_attachment_row(conn, row_id: int, att, content_hash: str, size_bytes: int, local_path: str) -> None:
+    conn.execute('''
+        UPDATE attachments
+        SET gmail_attachment_id = ?, filename = ?, content_hash = ?, size_bytes = ?, local_path = ?, downloaded_at = ?
+        WHERE id = ?
+    ''', (
+        att.get('attachment_id'),
+        att['filename'],
+        content_hash,
+        size_bytes,
+        local_path,
+        datetime.now().isoformat(),
+        row_id,
+    ))
+
+
 def _save_attachment(conn, msg, att, raw_bytes):
     """Persist a single decoded attachment. Returns a status dict matching the
     shape that download_doc_attachments used to return."""
     content_hash = hashlib.sha256(raw_bytes).hexdigest()
+    existing_for_message = _attachment_row_for_message(conn, msg['id'], att.get('attachment_id'))
+    if existing_for_message:
+        row_id, existing_path = existing_for_message
+        if _attachment_local_path_ready(existing_path):
+            return {'filename': att['filename'], 'path': existing_path, 'status': 'exists'}
+    else:
+        row_id = None
 
-    existing = conn.execute(
-        'SELECT local_path FROM attachments WHERE content_hash = ?',
-        (content_hash,)
-    ).fetchone()
-    if existing:
-        return {'filename': att['filename'], 'path': existing[0], 'status': 'exists'}
+    cached_path = _best_cached_attachment_path(conn, content_hash)
+    if cached_path:
+        if row_id is not None:
+            _update_attachment_row(conn, row_id, att, content_hash, len(raw_bytes), cached_path)
+        else:
+            _insert_attachment_row(conn, msg, att, content_hash, len(raw_bytes), cached_path)
+        return {'filename': att['filename'], 'path': cached_path, 'status': 'exists'}
 
     raw_path = generate_doc_path(msg, att['filename'])
     raw_path.parent.mkdir(parents=True, exist_ok=True)
     raw_path.write_bytes(raw_bytes)
 
     pdf_path = convert_to_pdf(raw_path)
-    stored_path = pdf_path if pdf_path else raw_path
+    if not pdf_path:
+        if raw_path.suffix.lower() == '.pdf':
+            stored_path = raw_path
+        else:
+            return {'filename': att['filename'], 'path': str(raw_path), 'status': 'conversion_failed'}
+    else:
+        stored_path = pdf_path
 
-    conn.execute('''
-        INSERT INTO attachments (message_id, filename, content_hash, size_bytes, local_path, downloaded_at)
-        VALUES (?, ?, ?, ?, ?, ?)
-    ''', (msg['id'], att['filename'], content_hash, len(raw_bytes), str(stored_path), datetime.now().isoformat()))
+    if row_id is not None:
+        _update_attachment_row(conn, row_id, att, content_hash, len(raw_bytes), str(stored_path))
+    else:
+        _insert_attachment_row(conn, msg, att, content_hash, len(raw_bytes), str(stored_path))
 
     return {'filename': att['filename'], 'path': str(stored_path), 'status': 'downloaded'}
 
@@ -571,6 +670,7 @@ def sync_messages(service, conn, days=7, with_pdfs=True):
             subject = get_header(headers, 'Subject')
             from_addr = get_header(headers, 'From')
             to_addr = get_header(headers, 'To')
+            message_header_id = get_header(headers, 'Message-ID')
             date = get_header(headers, 'Date')
 
             body_text, body_html = get_body_parts(payload)
@@ -582,8 +682,8 @@ def sync_messages(service, conn, days=7, with_pdfs=True):
 
             conn.execute('''
                 INSERT OR REPLACE INTO messages
-                (id, thread_id, label_ids, snippet, subject, from_addr, to_addr, date, body_text, body_html, raw_payload, synced_at, body_hash, internal_date)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (id, thread_id, label_ids, snippet, subject, from_addr, to_addr, message_header_id, date, body_text, body_html, raw_payload, synced_at, body_hash, internal_date)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', (
                 mid,
                 msg.get('threadId'),
@@ -592,6 +692,7 @@ def sync_messages(service, conn, days=7, with_pdfs=True):
                 subject,
                 from_addr,
                 to_addr,
+                message_header_id,
                 date,
                 body_text,
                 body_html,
@@ -609,7 +710,7 @@ def sync_messages(service, conn, days=7, with_pdfs=True):
                         continue
                     data = base64.urlsafe_b64decode(resp['data'])
                     d = _save_attachment(conn, msg, att, data)
-                    status = "✓" if d['status'] == 'downloaded' else "○"
+                    status = "✓" if d['status'] == 'downloaded' else ("!" if d['status'] == 'conversion_failed' else "○")
                     print(f"  {status} {d['filename']}")
                     if d['status'] == 'downloaded':
                         att_count += 1
@@ -646,17 +747,29 @@ def backfill_attachments(service, conn, days=7):
         atts = extract_doc_attachments(payload)
         if not atts:
             continue
-        # Skip if we already have at least one attachment row for this message —
-        # a good-enough heuristic to avoid re-scanning everything.
-        have_any = conn.execute(
-            'SELECT 1 FROM attachments WHERE message_id = ? LIMIT 1',
+
+        stored_rows = conn.execute(
+            'SELECT gmail_attachment_id, filename, local_path FROM attachments WHERE message_id = ?',
             (msg_id,)
-        ).fetchone()
-        if have_any:
-            continue
+        ).fetchall()
+        existing_ids = {
+            gmail_attachment_id
+            for gmail_attachment_id, _, local_path in stored_rows
+            if gmail_attachment_id and _attachment_local_path_ready(local_path)
+        }
+        legacy_filenames = {
+            filename
+            for gmail_attachment_id, filename, local_path in stored_rows
+            if not gmail_attachment_id and _attachment_local_path_ready(local_path)
+        }
+
         # Fake a minimal msg dict for generate_doc_path (needs headers + id)
         msg_stub = {'id': msg_id, 'payload': payload}
         for att in atts:
+            if att['attachment_id'] in existing_ids:
+                continue
+            if not existing_ids and att['filename'] in legacy_filenames:
+                continue
             key = f"{msg_id}:{att['attachment_id']}"
             pending.append((key, msg_stub, att))
 
@@ -675,7 +788,7 @@ def backfill_attachments(service, conn, days=7):
             continue
         data = base64.urlsafe_b64decode(resp['data'])
         d = _save_attachment(conn, stub, att, data)
-        status = "✓" if d['status'] == 'downloaded' else "○"
+        status = "✓" if d['status'] == 'downloaded' else ("!" if d['status'] == 'conversion_failed' else "○")
         print(f"  backfill {status} {d['filename']}")
         if d['status'] == 'downloaded':
             new_att += 1
@@ -688,22 +801,22 @@ def send_reply(service, conn, original_message_id: str, body_text: str):
     """Send a reply to an existing message."""
     # Get original message details from DB
     row = conn.execute(
-        'SELECT thread_id, subject, from_addr, id FROM messages WHERE id = ?',
+        'SELECT thread_id, subject, from_addr, id, message_header_id FROM messages WHERE id = ?',
         (original_message_id,)
     ).fetchone()
 
     if not row:
         raise ValueError(f"Message {original_message_id} not found in database")
 
-    thread_id, subject, from_addr, msg_id = row
+    thread_id, subject, from_addr, msg_id, message_header_id = row
 
     # Extract email address from "Name <email>" format
-    if '<' in from_addr:
-        to_email = from_addr.split('<')[1].rstrip('>')
-    else:
-        to_email = from_addr
+    _, to_email = parseaddr(from_addr or '')
+    if not to_email:
+        to_email = from_addr or ''
 
     # Ensure subject has Re: prefix
+    subject = subject or '(no subject)'
     if not subject.lower().startswith('re:'):
         subject = f"Re: {subject}"
 
@@ -711,8 +824,9 @@ def send_reply(service, conn, original_message_id: str, body_text: str):
     message = MIMEText(body_text)
     message['to'] = to_email
     message['subject'] = subject
-    message['In-Reply-To'] = msg_id
-    message['References'] = msg_id
+    if message_header_id:
+        message['In-Reply-To'] = message_header_id
+        message['References'] = message_header_id
 
     # Encode the message
     raw = base64.urlsafe_b64encode(message.as_bytes()).decode('utf-8')
@@ -856,13 +970,14 @@ def describe_all_documents(conn, source='pdfs', model=None, parallel=False, work
             FROM attachments a
             JOIN messages m ON a.message_id = m.id
             WHERE 1=1
+              AND a.local_path IS NOT NULL
               {pdf_filter}
             ORDER BY COALESCE(m.internal_date, 0) DESC
         '''
         if limit and source == 'pdfs':
             pdf_query += f' LIMIT {limit}'
         for path, _, filename, date, from_addr in conn.execute(pdf_query, pdf_params).fetchall():
-            if Path(path).exists():
+            if path and Path(path).suffix.lower() == '.pdf' and Path(path).exists():
                 tasks.append({'type': 'pdf', 'path': path, 'label': filename, 'model': model,
                               'gist': gist, 'date': date, 'sender': from_addr or '', 'dry_run': dry_run,
                               'thinking': thinking})
@@ -914,6 +1029,22 @@ def describe_all_documents(conn, source='pdfs', model=None, parallel=False, work
         return
 
     error_count = 0
+
+    def _cache_gist_failure(task: dict, error_msg: str) -> None:
+        if dry_run:
+            return
+        ch = task_content_hash(task)
+        if not ch:
+            return
+        err_json = make_error_gist_json(error_msg, task)
+        conn.execute(
+            'INSERT OR REPLACE INTO invoice_extractions '
+            '(content_hash, model_name, extracted_json, created_at, message_id) '
+            'VALUES (?, ?, ?, ?, ?)',
+            (ch, cache_key, err_json, datetime.now().isoformat(), task.get('message_id')),
+        )
+        conn.commit()
+
     if parallel and len(tasks) > 1:
         from rich.console import Console as RichConsole
         rc = RichConsole()
@@ -979,19 +1110,7 @@ def describe_all_documents(conn, source='pdfs', model=None, parallel=False, work
                             # this, prompt-block failures (PROHIBITED_CONTENT
                             # etc.) stay "unanalyzed" forever and burn retries
                             # every time. `--retry-failed` surfaces them back.
-                            if not dry_run:
-                                ch = task_content_hash(task)
-                                if ch:
-                                    err_json = make_error_gist_json(error or "no response", task)
-                                    conn.execute(
-                                        'INSERT OR REPLACE INTO invoice_extractions '
-                                        '(content_hash, model_name, extracted_json, created_at, message_id) '
-                                        'VALUES (?, ?, ?, ?, ?)',
-                                        (ch, cache_key, err_json,
-                                         datetime.now().isoformat(),
-                                         task.get('message_id')),
-                                    )
-                                    conn.commit()
+                            _cache_gist_failure(task, error or "no response")
                         else:
                             try:
                                 if Gist.model_validate_json(description).error:
@@ -1039,6 +1158,8 @@ def describe_all_documents(conn, source='pdfs', model=None, parallel=False, work
                                   sender=task.get('sender', ''), label=task['label'],
                                   emoji=emoji, error=task_error):
                     error_count += 1
+                    if task_error or not description:
+                        _cache_gist_failure(task, task_error or "no response")
             elif description:
                 if task['type'] == 'pdf' and not dry_run:
                     suffix = '.gist.txt' if gist else '.txt'
