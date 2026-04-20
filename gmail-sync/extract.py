@@ -313,7 +313,7 @@ def describe_document(
     if thinking:
         config_kwargs["thinking_config"] = types.ThinkingConfig(thinking_level=thinking)
 
-    last_error = None
+    last_error: Exception | None = None
     for attempt in range(MAX_RETRIES):
         try:
             response = client.models.generate_content(
@@ -322,10 +322,31 @@ def describe_document(
                 config=types.GenerateContentConfig(**config_kwargs),
             )
             description = response.text
-            if description and not dry_run:
-                save_description(conn, content_hash, description, cache_key, message_id=message_id)
-            conn.close()
-            return description
+            if description:
+                if not dry_run:
+                    save_description(conn, content_hash, description, cache_key, message_id=message_id)
+                conn.close()
+                return description
+
+            # Empty response.text: the call succeeded but Gemini returned no
+            # output. Diagnose why so the UI shows something more useful than
+            # "NO RESPONSE". Usually this is a safety block or a finish_reason
+            # like MAX_TOKENS / RECITATION.
+            reason_bits = []
+            pf = getattr(response, "prompt_feedback", None)
+            if pf is not None and getattr(pf, "block_reason", None):
+                reason_bits.append(f"prompt blocked: {pf.block_reason}")
+            for cand in getattr(response, "candidates", None) or []:
+                fr = getattr(cand, "finish_reason", None)
+                if fr and str(fr).rsplit(".", 1)[-1] != "STOP":
+                    reason_bits.append(f"finish_reason={fr}")
+                sr = getattr(cand, "safety_ratings", None) or []
+                blocked = [r for r in sr if getattr(r, "blocked", False)]
+                if blocked:
+                    cats = ",".join(str(getattr(r, "category", "?")) for r in blocked)
+                    reason_bits.append(f"safety blocked: {cats}")
+            reason = "; ".join(reason_bits) or "empty response.text"
+            raise RuntimeError(f"Gemini returned no text ({reason})")
         except Exception as e:
             last_error = e
             if attempt < MAX_RETRIES - 1:
@@ -337,7 +358,10 @@ def describe_document(
                     console.print(f"[red]Failed after {MAX_RETRIES} attempts: {last_error}[/red]")
 
     conn.close()
-    return None
+    # Re-raise so the parallel worker captures a real error string instead of
+    # silently returning None (which the UI renders as the uninformative
+    # "NO RESPONSE").
+    raise last_error if last_error else RuntimeError("Gemini call failed with no captured exception")
 
 
 def describe_pdf(pdf_path: str, api_key: str | None = None, use_cache: bool = True, model: str = MODEL_FLASH, quiet: bool = False, gist: bool = False, dry_run: bool = False, thinking: str = "medium") -> str | None:
@@ -355,7 +379,12 @@ def describe_pdf(pdf_path: str, api_key: str | None = None, use_cache: bool = Tr
 BODY_MAX_CHARS = 8000
 
 
-def describe_email(message_id: str, subject: str, body: str, model: str = MODEL_FLASH, quiet: bool = False, gist: bool = False, dry_run: bool = False, from_addr: str | None = None, thinking: str = "medium") -> str | None:
+def build_email_text(from_addr: str | None, subject: str | None, body: str | None) -> str:
+    """Canonical serialization of an email for the Gemini classifier.
+
+    Both `describe_email` (live) and the sync-side body_hash pre-filter must
+    use this exact string so that the content_hash cache lookup and the
+    NOT EXISTS filter agree on what "this email" is."""
     header = ""
     if from_addr:
         header += f"From: {from_addr}\n"
@@ -369,6 +398,19 @@ def describe_email(message_id: str, subject: str, body: str, model: str = MODEL_
     text = (header + "\n" + body).strip()
     if truncated:
         text += "\n\n[… body truncated at 8000 chars]"
+    return text
+
+
+def email_content_hash(from_addr: str | None, subject: str | None, body: str | None) -> str | None:
+    """sha256 of the Gemini input text. None for empty emails."""
+    text = build_email_text(from_addr, subject, body)
+    if not text:
+        return None
+    return get_content_hash(text.encode())
+
+
+def describe_email(message_id: str, subject: str, body: str, model: str = MODEL_FLASH, quiet: bool = False, gist: bool = False, dry_run: bool = False, from_addr: str | None = None, thinking: str = "medium") -> str | None:
+    text = build_email_text(from_addr, subject, body)
     if not text:
         return None
     content_hash = get_content_hash(text.encode())
@@ -534,7 +576,7 @@ def _relative_due(due_str: str | None) -> str:
     return f"due in {delta} days"
 
 
-def print_gist_row(console_, raw: str | None, *, date: str = "", sender: str = "", label: str = "", msg_id: str = "", id_map: dict | None = None, emoji: bool = False) -> bool:
+def print_gist_row(console_, raw: str | None, *, date: str = "", sender: str = "", label: str = "", msg_id: str = "", id_map: dict | None = None, emoji: bool = False, error: str | None = None) -> bool:
     """Returns True if this row was an error (no response or `error` field set)."""
     """Render one gist result (structured JSON or legacy free text) as two aligned lines.
 
@@ -549,9 +591,12 @@ def print_gist_row(console_, raw: str | None, *, date: str = "", sender: str = "
     INDENT2 = "       "
 
     if not raw:
-        head = f"  [red]✗[/red]  [dim]{date_s}[/dim]  {sender_s[:W_SENDER].upper():<{W_SENDER}}  [red]NO RESPONSE[/red]"
+        reason = "TASK FAILED" if error else "NO RESPONSE"
+        head = f"  [red]✗[/red]  [dim]{date_s}[/dim]  {sender_s[:W_SENDER].upper():<{W_SENDER}}  [red]{reason}[/red]"
         console_.print(head)
         console_.print(f"{INDENT2}[red]{label}[/red]")
+        if error:
+            console_.print(f"{INDENT2}[red]{error}[/red]")
         return True
 
     try:
@@ -559,6 +604,7 @@ def print_gist_row(console_, raw: str | None, *, date: str = "", sender: str = "
     except Exception as e:
         head = f"  [red]✗[/red]  [dim]{date_s}[/dim]  {sender_s[:W_SENDER].upper():<{W_SENDER}}  [red]SCHEMA PARSE FAILED[/red]"
         console_.print(head)
+        console_.print(f"{INDENT2}[red]{label}[/red]")
         console_.print(f"{INDENT2}[red]{e}[/red] — raw: [dim]{raw.strip()[:200]}[/dim]")
         return True
 
@@ -577,11 +623,12 @@ def print_gist_row(console_, raw: str | None, *, date: str = "", sender: str = "
 
     if g.error:
         head = (
-            f"  [red]⚠⚠⚠⚠[/red]  [dim]{date_s}[/dim]  "
-            f"{sender_disp}  [red]{cat_abbr} {intent_abbr}[/red]"
+            f"  [red]⚠[/red]  [dim]{date_s}[/dim]  "
+            f"{sender_disp}  [red]GIST ERROR[/red]"
         )
         console_.print(head)
-        console_.print(f"{INDENT2}[red]{g.error}[/red]  [dim]({g.clue})[/dim]")
+        console_.print(f"{INDENT2}[red]{label}[/red]")
+        console_.print(f"{INDENT2}[red]{g.error}[/red]  [dim]({g.clue or ''})[/dim]")
         return True
 
     sender_pad = (sender_disp.rstrip()[:20]).ljust(20)
@@ -681,23 +728,45 @@ def _week_bucket(s: str) -> tuple[int, str]:
     return (weeks, f"{months} month" + ("s" if months != 1 else "") + " ago")
 
 
-def print_gist_week(console_, week_label: str, results: list[tuple[dict, str | None]], *, emoji: bool = False, show_noise: bool = False, id_map: dict | None = None) -> int:
+def print_gist_week(console_, week_label: str, results: list, *, emoji: bool = False, show_noise: bool = False, id_map: dict | None = None) -> int:
     """Print a single week's rows, already sorted priority→sender→date.
+
+    `results` items may be (task, description) or (task, description, error).
+    Errored/unparseable rows are surfaced at the top of the week with their
+    exception message, so `analyze` doesn't silently swallow failures.
+
     Returns number of rows printed."""
-    rows: list[tuple[int, str, str, dict, str]] = []
-    for task, description in results:
+    rows: list[tuple[int, str, str, dict, str | None, str | None]] = []
+    for item in results:
+        if len(item) == 3:
+            task, description, error = item
+        else:
+            task, description = item
+            error = None
+
+        group: int
+        sender_key: str
         if not description:
-            continue
-        try:
-            g = Gist.model_validate_json(description)
-        except Exception:
-            continue
-        _, group = _status_of(g)
-        if group == 0 and not show_noise:
-            continue
+            # Surface task failure (exception, empty response) at the top of
+            # the week with priority group -2 so they sort above real rows.
+            group = -2
+            sender_key = (task.get('sender', '') or '').strip().lower()
+        else:
+            try:
+                g = Gist.model_validate_json(description)
+            except Exception:
+                group = -1  # parse failures right below task failures
+                sender_key = (task.get('sender', '') or '').strip().lower()
+                rows.append((group, sender_key, _date_sort_key(task.get('date', '')),
+                             task, description, error))
+                continue
+            _, group = _status_of(g)
+            if group == 0 and not show_noise:
+                continue
+            sender_key = (g.sender or task.get('sender', '') or '').strip().lower()
+
         date_key = _date_sort_key(task.get('date', ''))
-        sender_key = (g.sender or task.get('sender', '') or '').strip().lower()
-        rows.append((group, sender_key, date_key, task, description))
+        rows.append((group, sender_key, date_key, task, description, error))
 
     if not rows:
         return 0
@@ -705,7 +774,7 @@ def print_gist_week(console_, week_label: str, results: list[tuple[dict, str | N
     rows.sort(key=lambda r: (r[0], r[1], r[2]))
     console_.print()
     console_.print(f"[bold dim]— {week_label} —[/bold dim]")
-    for _, _, _, task, description in rows:
+    for _, _, _, task, description, error in rows:
         print_gist_row(
             console_, description,
             date=task.get('date', ''),
@@ -714,6 +783,7 @@ def print_gist_week(console_, week_label: str, results: list[tuple[dict, str | N
             msg_id=task.get('message_id') or task.get('msg_id') or '',
             id_map=id_map,
             emoji=emoji,
+            error=error,
         )
     return len(rows)
 
@@ -780,7 +850,11 @@ def main(args: list[str] | None = None):
                     console.print(f"[dim]Skipping missing file: {filename}[/dim]")
                     continue
 
-                description = describe_pdf(path, model=model)
+                try:
+                    description = describe_pdf(path, model=model)
+                except Exception as e:
+                    console.print(f"[red]✗ {filename}: {e}[/red]")
+                    continue
                 if description:
                     display_description(description, filename)
                     console.print()
@@ -798,7 +872,11 @@ def main(args: list[str] | None = None):
             for path, filename in rows:
                 if not Path(path).exists():
                     continue
-                description = describe_pdf(path, use_cache=False, model=model)
+                try:
+                    description = describe_pdf(path, use_cache=False, model=model)
+                except Exception as e:
+                    console.print(f"[red]✗ {filename}: {e}[/red]")
+                    continue
                 if description:
                     display_description(description, filename)
                     console.print()
@@ -806,7 +884,11 @@ def main(args: list[str] | None = None):
     else:
         # Process specific file
         pdf_path = args[0]
-        description = describe_pdf(pdf_path, use_cache=use_cache, model=model)
+        try:
+            description = describe_pdf(pdf_path, use_cache=use_cache, model=model)
+        except Exception as e:
+            console.print(f"[red]✗ {pdf_path}: {e}[/red]")
+            return
         if description:
             display_description(description, Path(pdf_path).name)
 

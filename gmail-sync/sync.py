@@ -70,11 +70,16 @@ def get_gmail_service():
     return build('gmail', 'v1', credentials=creds)
 
 
-def compute_body_hash(subject: str, body: str) -> str | None:
-    text = f"Subject: {subject or ''}\n\n{body or ''}".strip()
-    if not text:
-        return None
-    return hashlib.sha256(text.encode()).hexdigest()
+def compute_body_hash(subject: str, body: str, from_addr: str | None = None) -> str | None:
+    """Hash of the exact text describe_email feeds to Gemini.
+
+    Must match extract.email_content_hash so that the analyze-side
+    NOT EXISTS pre-filter and the describe_document content_hash cache
+    lookup agree on what "this email" is. Otherwise the pre-filter
+    mis-classifies cached rows as uncached and we re-enqueue (and
+    worse, re-render) 600+ cache hits on every `analyze` run."""
+    from extract import email_content_hash
+    return email_content_hash(from_addr, subject, body)
 
 
 def _backfill_internal_dates(conn):
@@ -93,13 +98,17 @@ def _backfill_internal_dates(conn):
 
 
 def _backfill_body_hashes(conn):
-    rows = conn.execute(
-        "SELECT id, subject, body_text FROM messages WHERE body_hash IS NULL AND body_text IS NOT NULL AND body_text != ''"
-    ).fetchall()
+    rows = conn.execute('''
+        SELECT id, subject, from_addr, body_text, body_html, snippet
+        FROM messages
+        WHERE body_hash IS NULL
+          AND COALESCE(NULLIF(body_text,''), NULLIF(body_html,''), NULLIF(snippet,'')) IS NOT NULL
+    ''').fetchall()
     if not rows:
         return
-    for mid, subj, body in rows:
-        h = compute_body_hash(subj, body)
+    for mid, subj, from_addr, body_text, body_html, snippet in rows:
+        body = body_text or body_html or snippet or ''
+        h = compute_body_hash(subj, body, from_addr)
         if h:
             conn.execute('UPDATE messages SET body_hash = ? WHERE id = ?', (h, mid))
     conn.commit()
@@ -177,13 +186,24 @@ def init_db():
     if 'message_id' not in cols:
         conn.execute('ALTER TABLE invoice_extractions ADD COLUMN message_id TEXT')
 
-    # Add body_hash column on messages (sha256 of "Subject: ...\n\nbody") so the
-    # "which emails still need a gist?" query can dedupe identical bodies that
-    # otherwise each re-hit Gemini on every run. Backfill any missing rows now.
+    # Add body_hash column on messages (sha256 of the exact text describe_email
+    # feeds to Gemini — see extract.build_email_text). Must match that formula
+    # exactly so the analyze-side NOT EXISTS filter actually catches cached
+    # rows; otherwise every run re-enqueues 600+ cache hits.
     msg_cols = [r[1] for r in conn.execute("PRAGMA table_info(messages)").fetchall()]
     if 'body_hash' not in msg_cols:
         conn.execute('ALTER TABLE messages ADD COLUMN body_hash TEXT')
     conn.execute('CREATE INDEX IF NOT EXISTS idx_messages_body_hash ON messages(body_hash)')
+
+    # One-shot migration: the old body_hash formula was "Subject: …\n\nbody"
+    # (no From header, no truncation marker, body_text only). That never
+    # matched extract.describe_email's content_hash, so the dedupe filter
+    # was effectively dead. Null everything and rebackfill with the new
+    # formula. Guarded by a user_version bump so we only do it once.
+    (user_version,) = conn.execute("PRAGMA user_version").fetchone()
+    if user_version < 1:
+        conn.execute('UPDATE messages SET body_hash = NULL')
+        conn.execute('PRAGMA user_version = 1')
     _backfill_body_hashes(conn)
 
     # Parsed timestamp from the `date` header (unix seconds) so SQL ORDER BY
@@ -577,7 +597,7 @@ def sync_messages(service, conn, days=7, with_pdfs=True):
                 body_html,
                 json.dumps(payload),
                 datetime.now().isoformat(),
-                compute_body_hash(subject, body_text),
+                compute_body_hash(subject, body_text or body_html or msg.get('snippet') or '', from_addr),
                 internal_date,
             ))
 
@@ -857,7 +877,7 @@ def describe_all_documents(conn, source='pdfs', model=None, parallel=False, work
 
             week_order = sorted(buckets.keys(), reverse=True)  # oldest first
             remaining = {wk: len(ts) for wk, ts in buckets.items()}
-            completed: dict[tuple[int, str], list[tuple[dict, str | None]]] = defaultdict(list)
+            completed: dict[tuple[int, str], list[tuple[dict, str | None, str | None]]] = defaultdict(list)
             print_cursor = 0  # index into week_order of the next week to print
 
             def _maybe_drain_weeks():
@@ -889,13 +909,14 @@ def describe_all_documents(conn, source='pdfs', model=None, parallel=False, work
                             try:
                                 if Gist.model_validate_json(description).error:
                                     error_count += 1
-                            except Exception:
+                            except Exception as e:
                                 error_count += 1
+                                error = error or f"schema parse failed: {e}"
                             if not dry_run and task['type'] == 'pdf':
                                 txt_path = Path(task['path']).with_name(
                                     Path(task['path']).stem + '.gist.txt')
                                 txt_path.write_text(description, encoding='utf-8')
-                        completed[wk].append((task, description))
+                        completed[wk].append((task, description, error))
                         remaining[wk] -= 1
                         progress.advance(ptask)
                         _maybe_drain_weeks()
@@ -914,16 +935,22 @@ def describe_all_documents(conn, source='pdfs', model=None, parallel=False, work
         from rich.console import Console as RichConsole
         rc = RichConsole()
         for i, task in enumerate(tasks):
-            if task['type'] == 'pdf':
-                description = describe_pdf(task['path'], model=model, gist=gist, quiet=True, dry_run=dry_run, thinking=thinking)
-            else:
-                description = describe_email(task['message_id'], task['subject'], task['body'],
-                                             model=model, gist=gist, quiet=True, dry_run=dry_run,
-                                             from_addr=task.get('sender') or None, thinking=thinking)
+            task_error: str | None = None
+            try:
+                if task['type'] == 'pdf':
+                    description = describe_pdf(task['path'], model=model, gist=gist, quiet=True, dry_run=dry_run, thinking=thinking)
+                else:
+                    description = describe_email(task['message_id'], task['subject'], task['body'],
+                                                 model=model, gist=gist, quiet=True, dry_run=dry_run,
+                                                 from_addr=task.get('sender') or None, thinking=thinking)
+            except Exception as e:
+                description = None
+                task_error = str(e)
 
             if gist:
                 if print_gist_row(rc, description, date=task.get('date', ''),
-                                  sender=task.get('sender', ''), label=task['label'], emoji=emoji):
+                                  sender=task.get('sender', ''), label=task['label'],
+                                  emoji=emoji, error=task_error):
                     error_count += 1
             elif description:
                 if task['type'] == 'pdf' and not dry_run:
