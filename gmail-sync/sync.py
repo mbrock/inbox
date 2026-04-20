@@ -4,6 +4,8 @@
 import os
 import re
 import json
+import time
+import random
 import sqlite3
 import base64
 import hashlib
@@ -32,6 +34,7 @@ from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 
 # Need both read and send scopes
 SCOPES = [
@@ -327,37 +330,77 @@ def convert_to_pdf(raw_path: Path) -> Path | None:
     return pdf_path if pdf_path.exists() else None
 
 
-# Gmail's batch endpoint accepts up to 100 sub-requests; 50 keeps the combined
-# response under a few MB when `format=full` bodies are large.
-BATCH_SIZE = 50
+# Gmail enforces a per-user concurrent-request ceiling (roughly 10-ish) and the
+# batch endpoint fans sub-requests out in parallel server-side, so a big batch
+# quickly trips "Too many concurrent requests for user" 429s. Keep chunks
+# comfortably under the ceiling and lean on per-sub-request retry for the rest.
+BATCH_SIZE = 10
+MAX_RETRIES = 6
 
 
-def _batch_execute(service, requests):
-    """Run `requests` (list of (request_id, HttpRequest) tuples) through Gmail's
-    batch endpoint in chunks of BATCH_SIZE. Returns (results_by_id, errors_by_id).
+def _is_rate_limited(exc):
+    if isinstance(exc, HttpError):
+        return exc.resp.status in (403, 429, 500, 503)
+    return False
+
+
+def _batch_execute(service, req_factories):
+    """req_factories: list of (request_id, callable_returning_fresh_HttpRequest).
+
+    Dispatches through Gmail's batch endpoint in chunks of BATCH_SIZE. On 429 /
+    rate-limit errors, retries the failing sub-requests (rebuilt via the factory)
+    with full-jitter exponential backoff. Returns (results_by_id, errors_by_id).
     """
+    factory_by_id = dict(req_factories)
     results: dict[str, dict] = {}
     errors: dict[str, Exception] = {}
+    pending = [rid for rid, _ in req_factories]
 
-    def _cb(request_id, response, exception):
-        if exception is not None:
-            errors[request_id] = exception
-        else:
-            results[request_id] = response
+    for attempt in range(MAX_RETRIES + 1):
+        if not pending:
+            break
 
-    for i in range(0, len(requests), BATCH_SIZE):
-        chunk = requests[i:i + BATCH_SIZE]
-        batch = service.new_batch_http_request(callback=_cb)
-        for rid, req in chunk:
-            batch.add(req, request_id=rid)
-        batch.execute()
+        round_errors: dict[str, Exception] = {}
+
+        def _cb(request_id, response, exception):
+            if exception is not None:
+                round_errors[request_id] = exception
+            else:
+                results[request_id] = response
+
+        for i in range(0, len(pending), BATCH_SIZE):
+            chunk_ids = pending[i:i + BATCH_SIZE]
+            batch = service.new_batch_http_request(callback=_cb)
+            for rid in chunk_ids:
+                batch.add(factory_by_id[rid](), request_id=rid)
+            batch.execute()
+
+        retryable = []
+        for rid, exc in round_errors.items():
+            if attempt < MAX_RETRIES and _is_rate_limited(exc):
+                retryable.append(rid)
+            else:
+                errors[rid] = exc
+
+        if not retryable:
+            break
+
+        # Full-jitter exponential backoff, capped at 30s.
+        delay = random.uniform(0, min(2 ** (attempt + 1), 30))
+        print(
+            f"  ~ rate-limited on {len(retryable)} req(s); retry {attempt + 1}/{MAX_RETRIES} in {delay:.1f}s",
+            flush=True,
+        )
+        time.sleep(delay)
+        pending = retryable
 
     return results, errors
 
 
 def _batch_get_messages(service, msg_ids):
     reqs = [
-        (mid, service.users().messages().get(userId='me', id=mid, format='full'))
+        (mid, (lambda mid=mid: service.users().messages().get(
+            userId='me', id=mid, format='full')))
         for mid in msg_ids
     ]
     return _batch_execute(service, reqs)
@@ -368,9 +411,8 @@ def _batch_get_attachments(service, att_keys):
     reqs = [
         (
             key,
-            service.users().messages().attachments().get(
-                userId='me', messageId=mid, id=aid,
-            ),
+            (lambda mid=mid, aid=aid: service.users().messages().attachments().get(
+                userId='me', messageId=mid, id=aid)),
         )
         for key, mid, aid in att_keys
     ]
