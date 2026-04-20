@@ -940,239 +940,320 @@ def search_gmail(service, query, max_results=20):
     return found
 
 
-def main():
-    import sys
+import sys
+import click
+from rich.console import Console as RichConsole
+from rich.table import Table
 
-    args = sys.argv[1:]
 
-    if not args:
-        print("Usage:")
-        print("  uv run sync.py sync [--days N] [--with-pdfs] [--analyze] [--flash] [--parallel] [--workers N]")
-        print("                      Sync emails, download PDFs, optionally analyze them")
-        print("  uv run sync.py search <query>")
-        print("                      Search Gmail directly (e.g., 'contact lens' or 'from:amazon')")
-        print("  uv run sync.py analyze [--flash] [--parallel] [--workers N]")
-        print("                      Analyze all unprocessed PDFs with Gemini")
-        print("  uv run sync.py extract [file.pdf]")
-        print("                      Extract/describe a specific PDF")
-        print("  uv run sync.py gists")
-        print("                      List all one-line gist summaries in a table")
-        print("  uv run sync.py pdfs")
-        print("                      List downloaded PDFs")
-        print("  uv run sync.py reply <message_id> <body>")
-        print("                      Reply to a message")
-        print()
-        print("Options:")
-        print("  --days N      Number of days to look back (default: 7)")
-        print("  --with-pdfs   Download PDF attachments")
-        print("  --analyze     Analyze PDFs after downloading")
-        print("  --flash           Use Gemini 3 Flash instead of Pro")
-        print("  --flash-lite      Use Gemini 3.1 Flash Lite (cheapest)")
-        print("  --gist            One-line telegraph summary per document")
-        print("  --emails          Analyze email bodies instead of PDFs")
-        print("  --all             Analyze both PDFs and emails")
-        print("  --parallel        Process PDFs in parallel")
-        print("  --workers N       Number of parallel workers (default: 4)")
-        print("  --limit N         Process only N PDFs, newest first")
+console = RichConsole()
+
+
+def _resolve_model(pro: bool, flash: bool) -> str:
+    from extract import MODEL_PRO, MODEL_FLASH, MODEL_FLASH_LITE
+    if pro:
+        return MODEL_PRO
+    if flash:
+        return MODEL_FLASH
+    return MODEL_FLASH_LITE
+
+
+@click.group()
+def cli():
+    """Gmail triage pipeline: sync, classify, reply."""
+    pass
+
+
+@cli.command("sync")
+@click.option("--days", default=7, show_default=True, help="Days to look back")
+@click.option("--analyze/--no-analyze", default=True, show_default=True, help="Run the Gemini classifier after syncing")
+@click.option("--gist/--no-gist", default=True, show_default=True, help="Use the structured Gist schema")
+@click.option("--parallel/--no-parallel", default=True, show_default=True, help="Run Gemini workers in parallel")
+@click.option("--workers", default=12, show_default=True, type=int, help="Parallel Gemini workers")
+@click.option("--source", type=click.Choice(["all", "emails", "pdfs"]), default="all", show_default=True)
+@click.option("--pro", is_flag=True, help="Use Gemini 3 Pro")
+@click.option("--flash", is_flag=True, help="Use Gemini 3 Flash")
+@click.option("--pdfs/--no-pdfs", default=True, show_default=True, help="Download PDF/XLS/XLSX/ODS attachments")
+@click.option("--thinking", type=click.Choice(["minimal", "low", "medium", "high"]), default="medium", show_default=True)
+@click.option("--emoji/--no-emoji", default=True, show_default=True)
+@click.option("--show-noise", is_flag=True, help="Include bulk/frivolous rows")
+@click.option("--limit", type=int, default=None, help="Cap analysis at N tasks, newest first")
+def cmd_sync(days, analyze, gist, parallel, workers, source, pro, flash, pdfs, thinking, emoji, show_noise, limit):
+    """Fetch new mail, download attachments, classify."""
+    model = _resolve_model(pro, flash)
+    service = get_gmail_service()
+    conn = init_db()
+    sync_messages(service, conn, days=days, with_pdfs=pdfs)
+    if analyze:
+        print(f"\nAnalyzing {source}...\n")
+        describe_all_documents(conn, source=source, model=model, parallel=parallel,
+                               workers=workers, limit=limit, gist=gist, thinking=thinking,
+                               emoji=emoji, show_noise=show_noise)
+    conn.close()
+
+
+@cli.command("analyze")
+@click.option("--source", type=click.Choice(["all", "emails", "pdfs"]), default="emails", show_default=True)
+@click.option("--gist/--no-gist", default=True, show_default=True)
+@click.option("--parallel/--no-parallel", default=True, show_default=True)
+@click.option("--workers", default=12, show_default=True, type=int)
+@click.option("--pro", is_flag=True)
+@click.option("--flash", is_flag=True)
+@click.option("--thinking", type=click.Choice(["minimal", "low", "medium", "high"]), default="medium", show_default=True)
+@click.option("--emoji/--no-emoji", default=True, show_default=True)
+@click.option("--show-noise", is_flag=True)
+@click.option("--limit", type=int, default=None)
+@click.option("--dry-run", is_flag=True, help="Skip DB reads/writes; preview on real samples")
+def cmd_analyze(source, gist, parallel, workers, pro, flash, thinking, emoji, show_noise, limit, dry_run):
+    """Run the classifier over uncached messages/PDFs."""
+    model = _resolve_model(pro, flash)
+    conn = init_db()
+    errs = describe_all_documents(
+        conn, source=source, model=model, parallel=parallel, workers=workers,
+        limit=limit, gist=gist, dry_run=dry_run, thinking=thinking,
+        emoji=emoji, show_noise=show_noise,
+    ) or 0
+    conn.close()
+    if errs:
+        sys.exit(1)
+
+
+@cli.command("backfill")
+@click.option("--days", default=30, show_default=True)
+def cmd_backfill(days):
+    """Scan already-synced messages for attachments that weren't downloaded."""
+    service = get_gmail_service()
+    conn = init_db()
+    n = backfill_attachments(service, conn, days=days)
+    print(f"Backfilled {n} attachment(s).")
+    conn.close()
+
+
+@cli.command("test-gist")
+@click.option("--limit", default=10, show_default=True, type=int)
+@click.option("--workers", default=12, show_default=True, type=int)
+@click.option("--pro", is_flag=True)
+@click.option("--flash", is_flag=True)
+@click.option("--thinking", type=click.Choice(["minimal", "low", "medium", "high"]), default="medium", show_default=True)
+@click.option("--emoji/--no-emoji", default=True, show_default=True)
+@click.option("--show-noise", is_flag=True)
+def cmd_test_gist(limit, workers, pro, flash, thinking, emoji, show_noise):
+    """Dry-run the email classifier on the N newest messages."""
+    model = _resolve_model(pro, flash)
+    conn = init_db()
+    errs = describe_all_documents(
+        conn, source="emails", model=model, parallel=True, workers=workers,
+        limit=limit, gist=True, dry_run=True, thinking=thinking,
+        emoji=emoji, show_noise=show_noise,
+    ) or 0
+    conn.close()
+    if errs:
+        sys.exit(1)
+
+
+@cli.command("gists")
+@click.option("--grep", "grep_pat", default=None, help="Substring filter on the clue text")
+@click.option("--weeks", type=int, default=None, help="Only the last N weeks")
+@click.option("--emoji/--no-emoji", default=True, show_default=True)
+@click.option("--show-noise", is_flag=True)
+def cmd_gists(grep_pat, weeks, emoji, show_noise):
+    """Print all cached structured gists, week by week."""
+    from extract import print_gist_week, _week_bucket, build_id_shortener
+    from collections import defaultdict
+    rc = RichConsole()
+
+    conn = init_db()
+    rows = conn.execute('''
+        SELECT m.date, m.from_addr, e.extracted_json, m.id
+        FROM invoice_extractions e
+        JOIN messages m ON e.message_id = m.id
+        WHERE e.model_name LIKE '%:gist:v3'
+    ''').fetchall()
+
+    if not rows:
+        print("No structured gists cached yet. Run: uv run sync.py analyze --source emails")
+        conn.close()
         return
 
-    cmd = args[0]
-    # PDF/XLS download is on by default; --no-pdfs disables it. --with-pdfs kept as a no-op alias.
-    with_pdfs = '--no-pdfs' not in args
-    analyze = '--analyze' in args
-    parallel = '--parallel' in args
+    all_ids = [r[0] for r in conn.execute('SELECT id FROM messages').fetchall()]
+    id_map = build_id_shortener(all_ids, safety=1)
+    conn.close()
 
-    # Parse --days N, --workers N, --limit N
-    days = 7
-    workers = 4
-    limit = None
-    for i, arg in enumerate(args):
-        if arg == '--days' and i + 1 < len(args):
-            try:
-                days = int(args[i + 1])
-            except ValueError:
-                pass
-        if arg == '--workers' and i + 1 < len(args):
-            try:
-                workers = int(args[i + 1])
-            except ValueError:
-                pass
-        if arg == '--limit' and i + 1 < len(args):
-            try:
-                limit = int(args[i + 1])
-            except ValueError:
-                pass
+    grep_lower = grep_pat.lower() if grep_pat else None
+    buckets: dict = defaultdict(list)
+    for date_str, from_addr, description, msg_id in rows:
+        if grep_lower and grep_lower not in (description or '').lower():
+            continue
+        week_idx, week_label = _week_bucket(date_str or '')
+        if weeks is not None and week_idx >= weeks:
+            continue
+        task_stub = {'date': date_str, 'sender': from_addr or '', 'label': msg_id, 'msg_id': msg_id}
+        buckets[(week_idx, week_label)].append((task_stub, description))
 
-    gist = '--gist' in args
-    dry_run = '--dry-run' in args
-    emoji = '--emoji' in args
-    show_noise = '--show-noise' in args
+    printed = 0
+    for (week_idx, week_label) in sorted(buckets.keys(), reverse=True):
+        printed += print_gist_week(
+            rc, week_label, buckets[(week_idx, week_label)],
+            emoji=emoji, show_noise=show_noise, id_map=id_map,
+        )
+    if not printed:
+        print("Nothing matches.")
 
-    # --thinking LEVEL   (minimal | low | medium | high)
-    thinking = 'medium'
-    for i, arg in enumerate(args):
-        if arg == '--thinking' and i + 1 < len(args):
-            if args[i + 1] in ('minimal', 'low', 'medium', 'high'):
-                thinking = args[i + 1]
 
-    # Source selection
-    if '--emails' in args:
-        source = 'emails'
-    elif '--all' in args:
-        source = 'all'
+@cli.command("list")
+@click.option("--limit", default=10, show_default=True, type=int)
+def cmd_list(limit):
+    """List recent messages with short IDs (for `reply`)."""
+    if not DB_FILE.exists():
+        console.print("[red]Gmail database not found. Run 'sync' first.[/red]")
+        return
+    conn = sqlite3.connect(DB_FILE)
+    rows = conn.execute(
+        '''SELECT id, date, from_addr, subject
+           FROM messages
+           ORDER BY COALESCE(internal_date, 0) DESC LIMIT ?''',
+        (limit,),
+    ).fetchall()
+    conn.close()
+    if not rows:
+        console.print("[yellow]No messages found.[/yellow]")
+        return
+    table = Table(title="Recent messages")
+    table.add_column("ID", style="cyan", no_wrap=True)
+    table.add_column("Date", style="dim")
+    table.add_column("From")
+    table.add_column("Subject")
+    for msg_id, date, from_addr, subject in rows:
+        from_short = (from_addr or "")[:35] + ("…" if from_addr and len(from_addr) > 35 else "")
+        subj_short = (subject or "")[:40] + ("…" if subject and len(subject) > 40 else "")
+        table.add_row(msg_id[:8], (date or "")[:16], from_short, subj_short)
+    console.print(table)
+    console.print("\n[dim]Use 'reply <ID>' to reply.[/dim]")
+
+
+@cli.command("search")
+@click.argument("term")
+@click.option("--limit", default=10, show_default=True, type=int)
+def cmd_search(term, limit):
+    """Search local DB by sender or subject (substring)."""
+    if not DB_FILE.exists():
+        console.print("[red]Gmail database not found. Run 'sync' first.[/red]")
+        return
+    conn = sqlite3.connect(DB_FILE)
+    rows = conn.execute(
+        '''SELECT id, date, from_addr, subject
+           FROM messages
+           WHERE from_addr LIKE ? OR subject LIKE ?
+           ORDER BY COALESCE(internal_date, 0) DESC LIMIT ?''',
+        (f'%{term}%', f'%{term}%', limit),
+    ).fetchall()
+    conn.close()
+    if not rows:
+        console.print(f"[yellow]No messages matching '{term}'[/yellow]")
+        return
+    table = Table(title=f"Messages matching '{term}'")
+    table.add_column("ID", style="cyan", no_wrap=True)
+    table.add_column("Date", style="dim")
+    table.add_column("From")
+    table.add_column("Subject")
+    for msg_id, date, from_addr, subject in rows:
+        from_short = (from_addr or "")[:30] + ("…" if from_addr and len(from_addr) > 30 else "")
+        subj_short = (subject or "")[:35] + ("…" if subject and len(subject) > 35 else "")
+        table.add_row(msg_id[:8], (date or "")[:16], from_short, subj_short)
+    console.print(table)
+
+
+@cli.command("search-remote")
+@click.argument("query", nargs=-1, required=True)
+@click.option("--max", "max_results", default=20, show_default=True, type=int)
+def cmd_search_remote(query, max_results):
+    """Search Gmail via the API (does not touch the local DB)."""
+    service = get_gmail_service()
+    search_gmail(service, " ".join(query), max_results=max_results)
+
+
+@cli.command("reply")
+@click.argument("message_id")
+@click.argument("body", required=False)
+@click.option("--yes", "-y", is_flag=True, help="Skip confirmation prompt")
+def cmd_reply(message_id, body, yes):
+    """Reply to a message by ID or 8-char prefix."""
+    if not DB_FILE.exists():
+        console.print("[red]Gmail database not found. Run 'sync' first.[/red]")
+        return
+    conn = init_db()
+    row = conn.execute(
+        '''SELECT id, subject, from_addr, date
+           FROM messages
+           WHERE id = ? OR id LIKE ?
+           ORDER BY COALESCE(internal_date, 0) DESC LIMIT 1''',
+        (message_id, f'{message_id}%'),
+    ).fetchone()
+    if not row:
+        console.print(f"[red]No message found with ID '{message_id}'[/red]")
+        conn.close()
+        return
+    msg_id, subject, from_addr, date = row
+
+    console.print("\n[bold]Replying to:[/bold]")
+    console.print(f"  ID: [cyan]{msg_id[:8]}[/cyan]")
+    console.print(f"  From: {from_addr}")
+    console.print(f"  Subject: {subject}")
+    console.print(f"  Date: {date}\n")
+
+    if not body:
+        console.print("[dim]Enter your reply (Ctrl+D when done):[/dim]")
+        body = sys.stdin.read().strip()
+    if not body:
+        console.print("[yellow]Empty body, aborting.[/yellow]")
+        conn.close()
+        return
+
+    console.print("\n[bold]Preview:[/bold]")
+    console.print(f"[dim]{body[:500]}{'…' if len(body) > 500 else ''}[/dim]\n")
+
+    if not yes and not click.confirm("Send this reply?"):
+        console.print("[yellow]Cancelled.[/yellow]")
+        conn.close()
+        return
+
+    service = get_gmail_service()
+    send_reply(service, conn, msg_id, body)
+    conn.close()
+
+
+@cli.command("pdfs")
+def cmd_pdfs():
+    """List recently downloaded PDFs."""
+    conn = init_db()
+    rows = conn.execute('''
+        SELECT a.filename, a.local_path, a.size_bytes, a.downloaded_at,
+               m.from_addr, m.subject
+        FROM attachments a
+        JOIN messages m ON a.message_id = m.id
+        ORDER BY a.downloaded_at DESC
+        LIMIT 20
+    ''').fetchall()
+    if rows:
+        print(f"\nRecent PDFs ({len(rows)} shown):\n")
+        for r in rows:
+            size_kb = r[2] / 1024 if r[2] else 0
+            print(f"  {r[0]} ({size_kb:.1f}KB)")
+            print(f"    From: {(r[4] or '')[:50]}")
+            print(f"    Path: {r[1]}")
+            print()
     else:
-        source = 'pdfs'
+        print("No PDFs downloaded yet. Run: uv run sync.py sync")
+    conn.close()
 
-    # Model selection
-    from extract import MODEL_PRO, MODEL_FLASH, MODEL_FLASH_LITE
-    if '--flash-lite' in args:
-        model = MODEL_FLASH_LITE
-    elif '--flash' in args:
-        model = MODEL_FLASH
-    else:
-        model = MODEL_PRO
 
-    if cmd == 'sync':
-        service = get_gmail_service()
-        conn = init_db()
-        sync_messages(service, conn, days=days, with_pdfs=with_pdfs)
-
-        if analyze:
-            print(f"\nAnalyzing {source}...\n")
-            describe_all_documents(conn, source=source, model=model, parallel=parallel, workers=workers, limit=limit, gist=gist)
-
-        conn.close()
-
-    elif cmd == 'analyze':
-        conn = init_db()
-        errs = describe_all_documents(conn, source=source, model=model, parallel=parallel, workers=workers, limit=limit, gist=gist, dry_run=dry_run, thinking=thinking, emoji=emoji, show_noise=show_noise) or 0
-        conn.close()
-        if errs:
-            sys.exit(1)
-
-    elif cmd == 'backfill':
-        service = get_gmail_service()
-        conn = init_db()
-        n = backfill_attachments(service, conn, days=days)
-        print(f"Backfilled {n} attachment(s).")
-        conn.close()
-
-    elif cmd == 'test-gist':
-        # Alias for: analyze --emails --gist --dry-run --limit N --parallel
-        conn = init_db()
-        errs = describe_all_documents(conn, source='emails', model=model, parallel=True,
-                                      workers=workers, limit=(limit or 10), gist=True, dry_run=True,
-                                      thinking=thinking, emoji=emoji, show_noise=show_noise) or 0
-        conn.close()
-        if errs:
-            sys.exit(1)
-
-    elif cmd == 'pdfs':
-        conn = init_db()
-        rows = conn.execute('''
-            SELECT a.filename, a.local_path, a.size_bytes, a.downloaded_at,
-                   m.from_addr, m.subject
-            FROM attachments a
-            JOIN messages m ON a.message_id = m.id
-            ORDER BY a.downloaded_at DESC
-            LIMIT 20
-        ''').fetchall()
-        if rows:
-            print(f"\nRecent PDFs ({len(rows)} shown):\n")
-            for r in rows:
-                size_kb = r[2] / 1024 if r[2] else 0
-                print(f"  {r[0]} ({size_kb:.1f}KB)")
-                print(f"    From: {r[4][:50]}")
-                print(f"    Path: {r[1]}")
-                print()
-        else:
-            print("No PDFs downloaded yet. Run: uv run sync.py sync --with-pdfs")
-        conn.close()
-
-    elif cmd == 'extract':
-        # Delegate to extract.py
-        from extract import main as extract_main
-        extract_main(args[1:])
-
-    elif cmd == 'reply':
-        if len(args) < 3:
-            print("Usage: uv run sync.py reply <message_id> <body>")
-            return
-        message_id = args[1]
-        body = args[2]
-        service = get_gmail_service()
-        conn = init_db()
-        send_reply(service, conn, message_id, body)
-        conn.close()
-        print("Reply sent!")
-
-    elif cmd == 'gists':
-        # Print all cached v3-schema gists, week-by-week, same layout as the
-        # live `analyze --gist` run.
-        from extract import print_gist_week, _week_bucket, build_id_shortener
-        from rich.console import Console as RichConsole
-        from collections import defaultdict
-        rc = RichConsole()
-
-        # Optional filters from argv
-        grep_pat = None
-        max_weeks = None
-        for i, a in enumerate(args):
-            if a == '--grep' and i + 1 < len(args):
-                grep_pat = args[i + 1].lower()
-            if a == '--weeks' and i + 1 < len(args):
-                try: max_weeks = int(args[i + 1])
-                except ValueError: pass
-
-        conn = init_db()
-        rows = conn.execute('''
-            SELECT m.date, m.from_addr, e.extracted_json, m.id
-            FROM invoice_extractions e
-            JOIN messages m ON e.message_id = m.id
-            WHERE e.model_name LIKE '%:gist:v3'
-        ''').fetchall()
-
-        if not rows:
-            print("No structured gists cached yet. Run: uv run sync.py analyze --emails --gist")
-            conn.close()
-            return
-
-        all_ids = [r[0] for r in conn.execute('SELECT id FROM messages').fetchall()]
-        id_map = build_id_shortener(all_ids, safety=1)
-        conn.close()
-
-        buckets: dict = defaultdict(list)
-        for date_str, from_addr, description, msg_id in rows:
-            if grep_pat and grep_pat not in (description or '').lower():
-                continue
-            week_idx, week_label = _week_bucket(date_str or '')
-            if max_weeks is not None and week_idx >= max_weeks:
-                continue
-            task_stub = {'date': date_str, 'sender': from_addr or '', 'label': msg_id, 'msg_id': msg_id}
-            buckets[(week_idx, week_label)].append((task_stub, description))
-
-        printed = 0
-        for (week_idx, week_label) in sorted(buckets.keys(), reverse=True):
-            printed += print_gist_week(rc, week_label, buckets[(week_idx, week_label)],
-                                       emoji=emoji, show_noise=show_noise, id_map=id_map)
-        if not printed:
-            print("Nothing matches.")
-
-    elif cmd == 'search':
-        if len(args) < 2:
-            print("Usage: uv run sync.py search <query>")
-            print("Examples:")
-            print("  uv run sync.py search 'contact lens'")
-            print("  uv run sync.py search 'from:amazon'")
-            print("  uv run sync.py search 'bio toric'")
-            return
-        query = ' '.join(args[1:])
-        service = get_gmail_service()
-        search_gmail(service, query)
-
-    else:
-        print(f"Unknown command: {cmd}")
+@cli.command("extract", context_settings={"ignore_unknown_options": True, "allow_extra_args": True})
+@click.pass_context
+def cmd_extract(ctx):
+    """Describe a specific PDF (delegates to extract.py)."""
+    from extract import main as extract_main
+    extract_main(ctx.args)
 
 
 if __name__ == '__main__':
-    main()
+    cli()
