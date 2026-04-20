@@ -795,6 +795,16 @@ def print_gist_week(console_, week_label: str, results: list, *, emoji: bool = F
                 rows.append((group, sender_key, _date_sort_key(task.get('date', '')),
                              task, description, error))
                 continue
+            if g.error:
+                # Cached classifier failure. Treat like a fresh task failure
+                # (group -1) so it surfaces at the top of the week regardless
+                # of noise filtering — erroring is not a "broadcast" even if
+                # make_error_gist_json's placeholder booleans would say so.
+                group = -1
+                sender_key = (g.sender or task.get('sender', '') or '').strip().lower()
+                rows.append((group, sender_key, _date_sort_key(task.get('date', '')),
+                             task, description, error))
+                continue
             _, group = _status_of(g)
             if group == 0 and not show_noise:
                 continue
