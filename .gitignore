@@ -1,0 +1,21 @@
+# OS
+.DS_Store
+
+# Env / secrets — never commit
+.env
+.envrc
+secret/
+gmail-sync/credentials.json
+gmail-sync/token.json
+
+# Local DB + downloaded attachments
+gmail-sync/gmail.db
+gmail-sync/gmail.db-journal
+gmail-sync/gmail.db-wal
+gmail-sync/gmail.db-shm
+pdf/
+
+# Python
+__pycache__/
+*.pyc
+.venv/

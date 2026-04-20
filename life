@@ -1,0 +1,1313 @@
+#!/usr/bin/env -S uv run --quiet --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+#     "click",
+#     "rich",
+#     "httpx",
+#     "redis",
+# ]
+# ///
+"""
+Life management CLI - unified interface for personal automation.
+
+Commands:
+  bank      Bank Frick operations (balance, transactions, send)
+  crypto    Crypto wallet balance (ETH, SKY)
+  mail      Gmail operations (sync, reply)
+  journal   Add entries to the journal
+"""
+
+import os
+import subprocess
+import sys
+from datetime import datetime
+from pathlib import Path
+
+import click
+from rich.console import Console
+from rich.table import Table
+
+G121_ROOT = Path(__file__).parent.resolve()
+GMAIL_DIR = G121_ROOT / "gmail-sync"
+JOURNAL_FILE = G121_ROOT / "JOURNAL.md"
+ENV_FILE = G121_ROOT / ".env"
+
+console = Console()
+
+
+def load_env() -> dict:
+    """Merge process env with ~/.envrc and g121/.env (supports `export` prefix)."""
+    env = os.environ.copy()
+    for path in (Path.home() / ".envrc", ENV_FILE):
+        if not path.exists():
+            continue
+        for raw in path.read_text().splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("export "):
+                line = line[len("export "):]
+            if "=" not in line:
+                continue
+            key, val = line.split("=", 1)
+            env_for_expand = {**env, "HOME": env.get("HOME", str(Path.home()))}
+            val = val.strip().strip('"').strip("'")
+            val = os.path.expanduser(val)
+            # Minimal $VAR / ${VAR} expansion using our merged env
+            import re
+            def _sub(m):
+                k = m.group(1) or m.group(2)
+                return env_for_expand.get(k, "")
+            val = re.sub(r"\$\{([A-Z_][A-Z0-9_]*)\}|\$([A-Z_][A-Z0-9_]*)", _sub, val)
+            env[key.strip()] = val
+    return env
+
+
+def run_frick(*args, capture=False):
+    """Run the installed `frick` Go binary with --key-file from env."""
+    env = load_env()
+    cmd = ["frick"]
+    key_file = env.get("FRICK_KEY_FILE")
+    if key_file:
+        cmd += ["--key-file", key_file]
+    cmd += list(args)
+    if capture:
+        result = subprocess.run(cmd, env=env, capture_output=True, text=True)
+        return result.stdout + result.stderr
+    else:
+        subprocess.run(cmd, env=env)
+
+
+def run_gmail_sync(*args):
+    """Run gmail-sync commands."""
+    env = os.environ.copy()
+    # Keep uv from complaining about an inherited VIRTUAL_ENV that points at
+    # whichever cache lane the last `uv run ...` used — let the project's
+    # .venv resolution take over.
+    env.pop("VIRTUAL_ENV", None)
+    cmd = ["uv", "run", "sync.py", *args]
+    subprocess.run(cmd, cwd=GMAIL_DIR, env=env)
+
+
+@click.group()
+@click.version_option(version="0.1.0")
+def cli():
+    """Life management CLI - unified interface for personal automation.
+
+    Consolidates bank, crypto, email, and journal tools into one place.
+    """
+    pass
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Bank commands
+# ─────────────────────────────────────────────────────────────────────────────
+
+@cli.group()
+def bank():
+    """Bank Frick operations."""
+    pass
+
+
+@bank.command("balance")
+def bank_balance():
+    """Show bank account balances."""
+    run_frick("balance")
+
+
+@bank.command("transactions")
+@click.option("--from", "from_date", help="Start date (YYYY-MM-DD)")
+def bank_transactions(from_date):
+    """List recent transactions."""
+    args = ["tx"]
+    if from_date:
+        args.extend(["--from", from_date])
+    run_frick(*args)
+
+
+@bank.command("pending")
+def bank_pending():
+    """List orders awaiting signature."""
+    run_frick("pending")
+
+
+@bank.command("send")
+@click.argument("amount", type=float)
+@click.argument("currency", required=False, default="EUR")
+@click.option("--iban", required=True, help="Creditor IBAN")
+@click.option("--name", required=True, help="Creditor name")
+@click.option("--ref", default="", help="Payment reference / note")
+@click.option("--from", "from_iban", help="Debtor IBAN (defaults to $FRICK_FROM_IBAN)")
+@click.option("--type", "tx_type", default="SEPA", help="SEPA, SEPA_INSTANT, BANK_INTERNAL, FOREIGN, etc.")
+@click.option("--no-sign", is_flag=True, help="Leave as PREPARED instead of signing immediately")
+@click.option("--test", is_flag=True, help="Dry-run")
+def bank_send(amount, currency, iban, name, ref, from_iban, tx_type, no_sign, test):
+    """Create + sign a payment in one shot.
+
+    Example:
+      life bank send 180.00 EUR --iban LV12... --name "Lelde" --ref "Rekins 329"
+    """
+    args = [
+        "create",
+        "--to-iban", iban,
+        "--to-name", name,
+        "--amount", f"{amount}",
+        "--currency", currency,
+        "--type", tx_type,
+    ]
+    if from_iban:
+        args += ["--from", from_iban]
+    if ref:
+        args += ["--ref", ref]
+    if test:
+        args += ["--test"]
+    if not no_sign and not test:
+        args += ["--sign"]
+    run_frick(*args)
+
+
+@bank.command(context_settings={"ignore_unknown_options": True, "allow_extra_args": True})
+@click.pass_context
+def frick(ctx):
+    """Pass-through to the `frick` CLI (any subcommand/flags)."""
+    run_frick(*ctx.args)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Crypto commands
+# ─────────────────────────────────────────────────────────────────────────────
+
+@cli.command()
+def crypto():
+    """Show crypto wallet balances (ETH, SKY)."""
+    wallet_script = Path.home() / ".local" / "bin" / "wallet-balance"
+    if wallet_script.exists():
+        subprocess.run([str(wallet_script)])
+    else:
+        console.print("[red]wallet-balance script not found at ~/.local/bin/wallet-balance[/red]")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Mail commands
+# ─────────────────────────────────────────────────────────────────────────────
+
+@cli.group()
+def mail():
+    """Gmail operations."""
+    pass
+
+
+@mail.command("sync")
+@click.option("--days", default=7, help="Days to look back")
+@click.option("--no-gists", is_flag=True, help="Skip gist analysis after syncing")
+@click.option("--pro", is_flag=True, help="Use Gemini Pro instead of Flash Lite for gists")
+@click.option("--workers", default=12, type=int, help="Parallel Gemini workers")
+def mail_sync(days, no_gists, pro, workers):
+    """Sync mail, download PDF/XLS attachments, gist with Flash Lite."""
+    args = ["sync", "--days", str(days)]
+    if not no_gists:
+        args += ["--analyze", "--gist", "--parallel", "--all", "--workers", str(workers)]
+        if not pro:
+            args += ["--flash-lite"]
+    run_gmail_sync(*args)
+
+
+@mail.command("backfill")
+@click.option("--days", default=30, help="Scan messages within this many days")
+def mail_backfill(days):
+    """Scan already-synced messages for PDF/XLS attachments that weren't downloaded yet."""
+    run_gmail_sync("backfill", "--days", str(days))
+
+
+@mail.command("gist")
+@click.option("--limit", type=int, default=None, help="Process at most N messages (newest first)")
+@click.option("--model", type=click.Choice(["flash-lite", "flash", "pro"]), default="flash-lite")
+@click.option("--thinking", type=click.Choice(["minimal", "low", "medium", "high"]), default="medium")
+@click.option("--workers", default=12, type=int, help="Parallel Gemini workers")
+@click.option("--emoji/--no-emoji", default=True, help="Emoji tags (default on)")
+@click.option("--show-noise", is_flag=True, help="Include bulk newsletters / promos (hidden by default)")
+@click.option("--test", is_flag=True, help="Dry-run: do not save to DB")
+def mail_gist(limit, model, thinking, workers, emoji, show_noise, test):
+    """Run the structured Gist classifier over uncached email (saves to DB).
+
+    Use --test to dry-run without touching the DB.
+    Use --limit N to cap the batch; by default it processes everything uncached.
+    """
+    args = ["analyze", "--emails", "--gist", "--parallel",
+            f"--{model}", "--thinking", thinking, "--workers", str(workers)]
+    if limit:
+        args += ["--limit", str(limit)]
+    if test:
+        args.append("--dry-run")
+    if emoji:
+        args.append("--emoji")
+    if show_noise:
+        args.append("--show-noise")
+    run_gmail_sync(*args)
+
+
+@mail.command("list")
+@click.option("--limit", default=10, help="Number of messages to show")
+def mail_list(limit):
+    """List recent emails with their IDs (for use with reply)."""
+    import sqlite3
+
+    db_path = GMAIL_DIR / "gmail.db"
+    if not db_path.exists():
+        console.print("[red]Gmail database not found. Run 'life mail sync' first.[/red]")
+        return
+
+    conn = sqlite3.connect(db_path)
+    rows = conn.execute(
+        '''SELECT id, date, from_addr, subject
+           FROM messages
+           ORDER BY date DESC LIMIT ?''',
+        (limit,)
+    ).fetchall()
+    conn.close()
+
+    if not rows:
+        console.print("[yellow]No messages found.[/yellow]")
+        return
+
+    table = Table(title="Recent Emails")
+    table.add_column("ID (short)", style="cyan", no_wrap=True)
+    table.add_column("Date", style="dim")
+    table.add_column("From")
+    table.add_column("Subject")
+
+    for msg_id, date, from_addr, subject in rows:
+        # Show short ID (first 8 chars) for usability
+        short_id = msg_id[:8]
+        from_short = from_addr[:35] + "..." if len(from_addr) > 35 else from_addr
+        subj_short = subject[:40] + "..." if len(subject) > 40 else subject
+        date_short = date[:16] if date else ""
+        table.add_row(short_id, date_short, from_short, subj_short)
+
+    console.print(table)
+    console.print("\n[dim]Use 'life mail reply <ID>' to reply to a message[/dim]")
+
+
+@mail.command("reply")
+@click.argument("message_id")
+@click.argument("body", required=False)
+@click.option("--yes", "-y", is_flag=True, help="Skip confirmation prompt")
+def mail_reply(message_id, body, yes):
+    """Reply to an email by message ID.
+
+    Use 'life mail list' or 'life mail search' to find message IDs.
+
+    Examples:
+      life mail reply 19bdb2f4 "Thanks for the info!"
+      life mail reply 19bdb2f4 --yes "Send without confirmation"
+    """
+    import sqlite3
+
+    db_path = GMAIL_DIR / "gmail.db"
+    if not db_path.exists():
+        console.print("[red]Gmail database not found. Run 'life mail sync' first.[/red]")
+        return
+
+    conn = sqlite3.connect(db_path)
+    # Support both full ID and prefix match
+    row = conn.execute(
+        '''SELECT id, subject, from_addr, date
+           FROM messages
+           WHERE id = ? OR id LIKE ?
+           ORDER BY date DESC LIMIT 1''',
+        (message_id, f'{message_id}%')
+    ).fetchone()
+
+    if not row:
+        console.print(f"[red]No message found with ID '{message_id}'[/red]")
+        console.print("[dim]Use 'life mail list' to see recent messages with IDs[/dim]")
+        return
+
+    msg_id, subject, from_addr, date = row
+    console.print(f"\n[bold]Replying to:[/bold]")
+    console.print(f"  ID: [cyan]{msg_id[:8]}[/cyan]")
+    console.print(f"  From: {from_addr}")
+    console.print(f"  Subject: {subject}")
+    console.print(f"  Date: {date}\n")
+
+    if not body:
+        console.print("[dim]Enter your reply (Ctrl+D when done):[/dim]")
+        body = sys.stdin.read().strip()
+
+    if not body:
+        console.print("[yellow]Empty body, aborting.[/yellow]")
+        return
+
+    console.print("\n[bold]Message preview:[/bold]")
+    console.print(f"[dim]{body[:500]}{'...' if len(body) > 500 else ''}[/dim]\n")
+
+    if not yes and not click.confirm("Send this reply?"):
+        console.print("[yellow]Cancelled.[/yellow]")
+        return
+
+    conn.close()
+    run_gmail_sync("reply", msg_id, body)
+
+
+@mail.command("search")
+@click.argument("term")
+@click.option("--limit", default=10, help="Max results")
+def mail_search(term, limit):
+    """Search emails by sender or subject."""
+    import sqlite3
+
+    db_path = GMAIL_DIR / "gmail.db"
+    if not db_path.exists():
+        console.print("[red]Gmail database not found. Run 'life mail sync' first.[/red]")
+        return
+
+    conn = sqlite3.connect(db_path)
+    rows = conn.execute(
+        '''SELECT id, date, from_addr, subject
+           FROM messages
+           WHERE from_addr LIKE ? OR subject LIKE ?
+           ORDER BY date DESC LIMIT ?''',
+        (f'%{term}%', f'%{term}%', limit)
+    ).fetchall()
+    conn.close()
+
+    if not rows:
+        console.print(f"[yellow]No messages matching '{term}'[/yellow]")
+        return
+
+    table = Table(title=f"Messages matching '{term}'")
+    table.add_column("ID", style="cyan", no_wrap=True)
+    table.add_column("Date", style="dim")
+    table.add_column("From")
+    table.add_column("Subject")
+
+    for msg_id, date, from_addr, subject in rows:
+        short_id = msg_id[:8]
+        from_short = from_addr[:30] + "..." if len(from_addr) > 30 else from_addr
+        subj_short = subject[:35] + "..." if len(subject) > 35 else subject
+        table.add_row(short_id, date[:16] if date else "", from_short, subj_short)
+
+    console.print(table)
+    console.print("\n[dim]Use 'life mail reply <ID>' to reply to a message[/dim]")
+
+
+@mail.command("gists")
+@click.option("--grep", "grep_pat", default=None, help="Substring filter on the clue text")
+@click.option("--weeks", type=int, default=None, help="Only the last N weeks")
+@click.option("--show-noise", is_flag=True, help="Include frivolous/broadcast (hidden by default)")
+@click.option("--emoji/--no-emoji", default=True, help="Emoji tags (default on)")
+def mail_gists(grep_pat, weeks, show_noise, emoji):
+    """Print all cached structured gists, same format as `mail gist`."""
+    args = ["gists"]
+    if emoji:
+        args.append("--emoji")
+    if show_noise:
+        args.append("--show-noise")
+    if grep_pat:
+        args += ["--grep", grep_pat]
+    if weeks is not None:
+        args += ["--weeks", str(weeks)]
+    run_gmail_sync(*args)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Journal commands
+# ─────────────────────────────────────────────────────────────────────────────
+
+@cli.group()
+def journal():
+    """Journal operations."""
+    pass
+
+
+@journal.command("add")
+@click.argument("entry", required=False)
+@click.option("--section", "-s", help="Section header (e.g., 'Gmail Setup')")
+def journal_add(entry, section):
+    """Add an entry to the journal.
+
+    Examples:
+      life journal add "Set up the life CLI tool"
+      life journal add --section "Life CLI" "Created unified command interface"
+    """
+    if not entry:
+        console.print("[dim]Enter journal entry (Ctrl+D when done):[/dim]")
+        entry = sys.stdin.read().strip()
+
+    if not entry:
+        console.print("[yellow]Empty entry, aborting.[/yellow]")
+        return
+
+    today = datetime.now().strftime("%Y-%m-%d")
+
+    content = JOURNAL_FILE.read_text() if JOURNAL_FILE.exists() else "# G121 Setup Journal\n"
+
+    # Check if today's date section exists
+    date_header = f"## {today}"
+    if date_header not in content:
+        # Add new date section after the title
+        lines = content.split("\n")
+        insert_idx = 2  # After title and blank line
+        lines.insert(insert_idx, f"\n{date_header}\n")
+        content = "\n".join(lines)
+
+    # Find position to insert entry (after the date header)
+    if section:
+        new_entry = f"\n### {section}\n\n{entry}\n"
+    else:
+        new_entry = f"\n{entry}\n"
+
+    # Insert after the date header
+    date_pos = content.find(date_header)
+    insert_pos = content.find("\n", date_pos) + 1
+
+    # Skip past any existing content for today until we hit next date or section
+    next_section = content.find("\n## ", insert_pos)
+    if next_section == -1:
+        next_section = len(content)
+
+    content = content[:next_section] + new_entry + content[next_section:]
+
+    JOURNAL_FILE.write_text(content)
+    console.print(f"[green]Added to journal ({today})[/green]")
+
+
+@journal.command("show")
+@click.option("--days", default=7, help="Show entries from last N days")
+def journal_show(days):
+    """Show recent journal entries."""
+    if not JOURNAL_FILE.exists():
+        console.print("[yellow]No journal file found.[/yellow]")
+        return
+
+    content = JOURNAL_FILE.read_text()
+    console.print(content[:3000] if len(content) > 3000 else content)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Summary command
+# ─────────────────────────────────────────────────────────────────────────────
+
+@cli.command()
+def summary():
+    """Show a quick summary of finances."""
+    console.print("\n[bold]Bank Frick[/bold]")
+    run_frick("balance")
+
+    console.print("\n[bold]Crypto Wallet[/bold]")
+    wallet_script = Path.home() / ".local" / "bin" / "wallet-balance"
+    if wallet_script.exists():
+        subprocess.run([str(wallet_script)])
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Telegram commands
+# ─────────────────────────────────────────────────────────────────────────────
+
+TELEGRAM_BOT_TOKEN = "947429422:AAHqN2CuQZVhttQ3FnbSisNZIYYKtILMj7c"
+TELEGRAM_CHAT_ID = "-5089774249"
+TELEGRAM_DB = G121_ROOT / "telegram.db"
+TELEGRAM_MEDIA_DIR = G121_ROOT / "telegram-media"
+
+
+def init_telegram_db():
+    """Initialize Telegram SQLite database."""
+    import sqlite3
+    conn = sqlite3.connect(TELEGRAM_DB)
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS updates (
+            update_id INTEGER PRIMARY KEY,
+            raw_json TEXT NOT NULL,
+            message_id INTEGER,
+            chat_id INTEGER,
+            from_id INTEGER,
+            from_name TEXT,
+            date INTEGER,
+            message_type TEXT,
+            text_content TEXT,
+            file_id TEXT,
+            local_path TEXT,
+            synced_at TEXT
+        )
+    ''')
+    conn.execute('CREATE INDEX IF NOT EXISTS idx_date ON updates(date)')
+
+    # Migration: add local_path column if it doesn't exist
+    try:
+        conn.execute('ALTER TABLE updates ADD COLUMN local_path TEXT')
+    except sqlite3.OperationalError:
+        pass  # Column already exists
+
+    conn.commit()
+    return conn
+
+
+def download_telegram_file(file_id: str, message_type: str, date: int) -> str | None:
+    """Download a file from Telegram and return local path."""
+    import httpx
+
+    # Get file info
+    response = httpx.get(
+        f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getFile",
+        params={"file_id": file_id},
+        timeout=30,
+    )
+    result = response.json()
+    if not result.get("ok"):
+        console.print(f"[yellow]Could not get file info: {result}[/yellow]")
+        return None
+
+    file_path = result["result"].get("file_path")
+    if not file_path:
+        return None
+
+    # Create media directory
+    TELEGRAM_MEDIA_DIR.mkdir(exist_ok=True)
+
+    # Determine extension from file_path
+    ext = Path(file_path).suffix or {
+        "voice": ".ogg",
+        "photo": ".jpg",
+        "sticker": ".webp",
+        "document": "",
+    }.get(message_type, "")
+
+    # Create filename with date prefix
+    dt = datetime.fromtimestamp(date) if date else datetime.now()
+    filename = f"{dt.strftime('%Y%m%d-%H%M%S')}-{message_type}{ext}"
+    local_path = TELEGRAM_MEDIA_DIR / filename
+
+    # Download file
+    file_url = f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{file_path}"
+    response = httpx.get(file_url, timeout=60)
+    if response.status_code == 200:
+        local_path.write_bytes(response.content)
+        return str(local_path)
+    else:
+        console.print(f"[yellow]Failed to download {file_url}[/yellow]")
+        return None
+
+
+def parse_update(update: dict) -> dict:
+    """Extract fields from a Telegram update for indexing."""
+    msg = update.get("message") or update.get("edited_message") or {}
+    reaction = update.get("message_reaction")
+
+    from_user = msg.get("from", {})
+    chat = msg.get("chat", {})
+
+    # Determine message type and content
+    if "text" in msg:
+        msg_type = "text"
+        text_content = msg["text"]
+        file_id = None
+    elif "voice" in msg:
+        msg_type = "voice"
+        text_content = f"[Voice message, {msg['voice'].get('duration', 0)}s]"
+        file_id = msg["voice"].get("file_id")
+    elif "photo" in msg:
+        msg_type = "photo"
+        text_content = msg.get("caption", "[Photo]")
+        # Get largest photo
+        file_id = msg["photo"][-1].get("file_id") if msg["photo"] else None
+    elif "document" in msg:
+        msg_type = "document"
+        text_content = msg.get("caption") or f"[Document: {msg['document'].get('file_name', 'unknown')}]"
+        file_id = msg["document"].get("file_id")
+    elif "sticker" in msg:
+        msg_type = "sticker"
+        text_content = f"[Sticker: {msg['sticker'].get('emoji', '')}]"
+        file_id = msg["sticker"].get("file_id")
+    elif reaction:
+        msg_type = "reaction"
+        emoji = reaction.get("new_reaction", [{}])[0].get("emoji", "")
+        text_content = f"[Reaction: {emoji}]"
+        file_id = None
+        chat = reaction.get("chat", {})
+        from_user = reaction.get("user", {})
+    else:
+        msg_type = "unknown"
+        text_content = None
+        file_id = None
+
+    from_name = from_user.get("first_name", "")
+    if from_user.get("last_name"):
+        from_name += " " + from_user["last_name"]
+    if from_user.get("is_bot"):
+        from_name += " [bot]"
+
+    return {
+        "update_id": update["update_id"],
+        "message_id": msg.get("message_id"),
+        "chat_id": chat.get("id"),
+        "from_id": from_user.get("id"),
+        "from_name": from_name,
+        "date": msg.get("date") or (reaction.get("date") if reaction else None),
+        "message_type": msg_type,
+        "text_content": text_content,
+        "file_id": file_id,
+    }
+
+
+@cli.group()
+def telegram():
+    """Telegram operations (Barblebot)."""
+    pass
+
+
+@telegram.command("send")
+@click.argument("message", nargs=-1, required=True)
+def telegram_send(message):
+    """Send a message via Telegram.
+
+    Examples:
+      life telegram send "Hello from the command line"
+      life telegram send Bank balance is 9533 SEK
+    """
+    import json
+    import httpx
+
+    text = " ".join(message)
+
+    response = httpx.post(
+        f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+        data={
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": text,
+            "parse_mode": "Markdown",
+        },
+    )
+
+    result = response.json()
+    if result.get("ok"):
+        # Store the sent message in our database
+        msg = result.get("result", {})
+        conn = init_telegram_db()
+        now = datetime.now().isoformat()
+
+        # Use negative message_id as update_id for sent messages (to avoid conflicts)
+        fake_update_id = -msg.get("message_id", 0)
+
+        try:
+            conn.execute('''
+                INSERT INTO updates (update_id, raw_json, message_id, chat_id, from_id,
+                                    from_name, date, message_type, text_content, file_id, synced_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                fake_update_id,
+                json.dumps(result),
+                msg.get("message_id"),
+                msg.get("chat", {}).get("id"),
+                msg.get("from", {}).get("id"),
+                "Barblebot [bot]",
+                msg.get("date"),
+                "text",
+                text,
+                None,
+                now,
+            ))
+            conn.commit()
+        except Exception:
+            pass  # Don't fail if DB write fails
+        finally:
+            conn.close()
+
+        console.print("[green]Sent![/green]")
+    else:
+        console.print(f"[red]Error: {result}[/red]")
+
+
+@telegram.command("sync")
+def telegram_sync():
+    """Sync recent messages from Telegram to local database."""
+    import sqlite3
+    import json
+    import httpx
+
+    conn = init_telegram_db()
+
+    # Get the highest update_id we have
+    row = conn.execute("SELECT MAX(update_id) FROM updates").fetchone()
+    last_update_id = row[0] if row[0] else 0
+
+    # Fetch new updates (offset = last_id + 1 to get only new ones)
+    params = {"limit": 100, "allowed_updates": ["message", "edited_message", "message_reaction"]}
+    if last_update_id:
+        params["offset"] = last_update_id + 1
+
+    response = httpx.get(
+        f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates",
+        params=params,
+        timeout=30,
+    )
+
+    result = response.json()
+    if not result.get("ok"):
+        console.print(f"[red]Error: {result}[/red]")
+        return
+
+    updates = result.get("result", [])
+    if not updates:
+        console.print("[dim]No new messages[/dim]")
+        conn.close()
+        return
+
+    # Store each update
+    now = datetime.now().isoformat()
+    new_count = 0
+    media_count = 0
+    for update in updates:
+        parsed = parse_update(update)
+
+        # Download media if there's a file_id
+        local_path = None
+        if parsed["file_id"]:
+            console.print(f"[dim]Downloading {parsed['message_type']}...[/dim]")
+            local_path = download_telegram_file(
+                parsed["file_id"],
+                parsed["message_type"],
+                parsed["date"]
+            )
+            if local_path:
+                media_count += 1
+
+        try:
+            conn.execute('''
+                INSERT INTO updates (update_id, raw_json, message_id, chat_id, from_id,
+                                    from_name, date, message_type, text_content, file_id, local_path, synced_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                parsed["update_id"],
+                json.dumps(update),  # Store full raw JSON
+                parsed["message_id"],
+                parsed["chat_id"],
+                parsed["from_id"],
+                parsed["from_name"],
+                parsed["date"],
+                parsed["message_type"],
+                parsed["text_content"],
+                parsed["file_id"],
+                local_path,
+                now,
+            ))
+            new_count += 1
+        except sqlite3.IntegrityError:
+            pass  # Already exists
+
+    conn.commit()
+    conn.close()
+    msg = f"[green]Synced {new_count} new messages[/green]"
+    if media_count:
+        msg += f" [dim]({media_count} media files downloaded)[/dim]"
+    console.print(msg)
+
+
+@telegram.command("list")
+@click.option("--limit", default=20, help="Number of messages to show")
+@click.option("--no-sync", is_flag=True, help="Skip syncing before listing")
+@click.pass_context
+def telegram_list(ctx, limit, no_sync):
+    """Show recent Telegram messages (syncs automatically)."""
+
+    # Sync first unless --no-sync
+    if not no_sync:
+        ctx.invoke(telegram_sync)
+
+    if not TELEGRAM_DB.exists():
+        console.print("[yellow]No messages yet.[/yellow]")
+        return
+
+    conn = init_telegram_db()  # This also runs migrations
+    rows = conn.execute('''
+        SELECT date, from_name, message_type, text_content, local_path
+        FROM updates
+        WHERE text_content IS NOT NULL
+        ORDER BY date DESC
+        LIMIT ?
+    ''', (limit,)).fetchall()
+    conn.close()
+
+    if not rows:
+        console.print("[yellow]No messages found.[/yellow]")
+        return
+
+    # Reverse to show chronological order
+    rows = list(reversed(rows))
+
+    console.print("\n[bold]Telegram - Mikael & Barblebot[/bold]\n")
+
+    for date, from_name, msg_type, text, local_path in rows:
+        # Format timestamp
+        if date:
+            dt = datetime.fromtimestamp(date)
+            time_str = dt.strftime("%Y-%m-%d %H:%M")
+        else:
+            time_str = "?"
+
+        # Color based on sender
+        if "bot" in from_name.lower():
+            name_style = "cyan"
+        else:
+            name_style = "green"
+
+        # Format based on message type
+        if msg_type == "voice":
+            text_display = f"[italic]{text}[/italic]"
+            if local_path:
+                text_display += f" [dim]({Path(local_path).name})[/dim]"
+        elif msg_type == "photo":
+            text_display = f"[dim]{text}[/dim]"
+            if local_path:
+                text_display += f" [dim]({Path(local_path).name})[/dim]"
+        elif msg_type == "reaction":
+            text_display = f"[yellow]{text}[/yellow]"
+        else:
+            text_display = text
+
+        console.print(f"[dim]{time_str}[/dim] [{name_style}]{from_name}[/{name_style}]: {text_display}")
+
+
+@telegram.command("download")
+def telegram_download():
+    """Download media for messages that don't have local files yet."""
+
+    if not TELEGRAM_DB.exists():
+        console.print("[yellow]No Telegram database. Run 'life telegram sync' first.[/yellow]")
+        return
+
+    conn = init_telegram_db()  # This also runs migrations
+    rows = conn.execute('''
+        SELECT update_id, file_id, message_type, date
+        FROM updates
+        WHERE file_id IS NOT NULL AND local_path IS NULL
+    ''').fetchall()
+
+    if not rows:
+        console.print("[dim]No media files to download[/dim]")
+        conn.close()
+        return
+
+    console.print(f"[dim]Downloading {len(rows)} media files...[/dim]")
+
+    downloaded = 0
+    for update_id, file_id, msg_type, date in rows:
+        local_path = download_telegram_file(file_id, msg_type, date)
+        if local_path:
+            conn.execute(
+                'UPDATE updates SET local_path = ? WHERE update_id = ?',
+                (local_path, update_id)
+            )
+            downloaded += 1
+            console.print(f"  [green]Downloaded[/green] {Path(local_path).name}")
+
+    conn.commit()
+    conn.close()
+    console.print(f"[green]Downloaded {downloaded} files[/green]")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Transcript commands
+# ─────────────────────────────────────────────────────────────────────────────
+
+@cli.group(invoke_without_command=True)
+@click.option("--hours", "-h", default=1.0, help="Hours of history to show")
+@click.pass_context
+def transcript(ctx, hours):
+    """Voice transcription from Swash/Deepgram.
+
+    Examples:
+      life transcript          Show last hour of transcripts
+      life transcript -h 2     Show last 2 hours
+      life transcript follow   Continuously print new transcripts
+    """
+    if ctx.invoked_subcommand is None:
+        ctx.invoke(transcript_show, hours=hours)
+
+
+@transcript.command("show")
+@click.option("--hours", "-h", default=1.0, help="Hours of history to show")
+@click.option("--timestamps/--no-timestamps", "-t", default=True, help="Show timestamps per line")
+def transcript_show(hours, timestamps):
+    """Show recent transcripts."""
+    import redis
+
+    r = redis.Redis(decode_responses=True)
+
+    # Calculate time range
+    now_ms = int(datetime.now().timestamp() * 1000)
+    start_ms = int(now_ms - hours * 3600 * 1000)
+
+    # Get entries from Redis stream
+    try:
+        entries = r.xrange("transcripts", f"{start_ms}-0", "+")
+    except redis.ConnectionError:
+        console.print("[red]Cannot connect to Redis. Is it running?[/red]")
+        return
+
+    if not entries:
+        console.print(f"[yellow]No transcripts in the last {hours} hour(s)[/yellow]")
+        return
+
+    # Filter to final transcripts only
+    finals = []
+    for entry_id, fields in entries:
+        if fields.get("is_final") == "1" and fields.get("transcript"):
+            timestamp = fields.get("timestamp", "")
+            text = fields.get("transcript", "")
+            finals.append((timestamp, text))
+
+    if not finals:
+        console.print(f"[yellow]No final transcripts in the last {hours} hour(s)[/yellow]")
+        return
+
+    console.print(f"\n[bold]Transcripts (last {hours}h)[/bold]\n")
+
+    for timestamp, text in finals:
+        try:
+            dt = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+            time_str = dt.strftime("%H:%M:%S")
+        except:
+            time_str = "??:??:??"
+
+        if timestamps:
+            console.print(f"[dim]{time_str}[/dim] {text}")
+        else:
+            console.print(f"  {text}")
+
+    console.print(f"\n[dim]Total: {len(finals)} utterances[/dim]")
+
+
+def mux_opus_to_ogg(opus_frames: list[bytes], sample_rate: int = 48000, channels: int = 2) -> bytes:
+    """Mux raw Opus frames into an OggOpus container without re-encoding.
+
+    This is FAST because it just adds Ogg page headers around existing Opus data.
+    """
+    import struct
+    import zlib
+
+    def ogg_crc32(data: bytes) -> int:
+        # Ogg uses CRC32 with polynomial 0x04c11db7
+        crc_table = []
+        for i in range(256):
+            crc = i << 24
+            for _ in range(8):
+                if crc & 0x80000000:
+                    crc = ((crc << 1) ^ 0x04c11db7) & 0xffffffff
+                else:
+                    crc = (crc << 1) & 0xffffffff
+            crc_table.append(crc)
+
+        crc = 0
+        for byte in data:
+            crc = ((crc << 8) ^ crc_table[((crc >> 24) ^ byte) & 0xff]) & 0xffffffff
+        return crc
+
+    def make_page(granule: int, serial: int, page_seq: int, segments: list[bytes],
+                  bos: bool = False, eos: bool = False) -> bytes:
+        # Build segment table
+        seg_table = b""
+        for seg in segments:
+            length = len(seg)
+            while length >= 255:
+                seg_table += bytes([255])
+                length -= 255
+            seg_table += bytes([length])
+
+        header_type = (0x02 if bos else 0) | (0x04 if eos else 0)
+
+        # Build header without CRC
+        header = b"OggS"  # capture pattern
+        header += bytes([0])  # version
+        header += bytes([header_type])
+        header += struct.pack("<Q", granule)  # granule position
+        header += struct.pack("<I", serial)   # serial number
+        header += struct.pack("<I", page_seq)  # page sequence
+        header += struct.pack("<I", 0)  # CRC placeholder
+        header += bytes([len(segments)])  # segment count
+        header += seg_table
+
+        page_data = b"".join(segments)
+        full_page = header + page_data
+
+        # Calculate and insert CRC
+        crc = ogg_crc32(full_page)
+        full_page = full_page[:22] + struct.pack("<I", crc) + full_page[26:]
+
+        return full_page
+
+    serial = 0x12345678  # arbitrary stream serial
+    pages = []
+    page_seq = 0
+
+    # OpusHead (ID header)
+    opus_head = b"OpusHead"
+    opus_head += bytes([1])  # version
+    opus_head += bytes([channels])
+    opus_head += struct.pack("<H", 0)  # pre-skip
+    opus_head += struct.pack("<I", sample_rate)  # input sample rate
+    opus_head += struct.pack("<h", 0)  # output gain
+    opus_head += bytes([0])  # channel mapping family
+
+    pages.append(make_page(0, serial, page_seq, [opus_head], bos=True))
+    page_seq += 1
+
+    # OpusTags (comment header)
+    vendor = b"life-cli"
+    opus_tags = b"OpusTags"
+    opus_tags += struct.pack("<I", len(vendor)) + vendor
+    opus_tags += struct.pack("<I", 0)  # no user comments
+
+    pages.append(make_page(0, serial, page_seq, [opus_tags]))
+    page_seq += 1
+
+    # Audio pages - pack multiple frames per page
+    # Ogg page can have max 255 lacing values total
+    # Each Opus frame ~100-300 bytes needs 1-2 lacing values
+    # Use conservative limit of 50 frames per page (~100 lacing values)
+    granule = 0
+    samples_per_frame = 960  # 20ms at 48kHz
+    current_segments = []
+    max_frames_per_page = 50
+
+    for i, frame in enumerate(opus_frames):
+        is_last = (i == len(opus_frames) - 1)
+        current_segments.append(frame)
+        granule += samples_per_frame
+
+        if len(current_segments) >= max_frames_per_page or is_last:
+            pages.append(make_page(granule, serial, page_seq, current_segments, eos=is_last))
+            page_seq += 1
+            current_segments = []
+
+    return b"".join(pages)
+
+
+LAST_RETRANSCRIBE_FILE = Path.home() / "G121" / ".last-retranscribe"
+
+
+def get_last_retranscribe_time() -> int | None:
+    """Get timestamp (microseconds) of last retranscription."""
+    if LAST_RETRANSCRIBE_FILE.exists():
+        try:
+            return int(LAST_RETRANSCRIBE_FILE.read_text().strip())
+        except:
+            pass
+    return None
+
+
+def set_last_retranscribe_time(timestamp_us: int):
+    """Save timestamp of this retranscription."""
+    LAST_RETRANSCRIBE_FILE.write_text(str(timestamp_us))
+
+
+@transcript.command("retranscribe")
+@click.option("--last", "last_minutes", type=float, help="Retranscribe last N minutes")
+@click.option("--from", "from_time", help="Start time (HH:MM or HH:MM:SS)")
+@click.option("--to", "to_time", help="End time (HH:MM or HH:MM:SS)")
+@click.option("--since-last", "since_last", is_flag=True, help="Retranscribe since last retranscription")
+def transcript_retranscribe(last_minutes, from_time, to_time, since_last):
+    """Re-transcribe audio using Deepgram's batch API for better accuracy.
+
+    Examples:
+      life transcript retranscribe --last 5      Last 5 minutes
+      life transcript retranscribe --from 17:25 --to 17:30
+      life transcript retranscribe --since-last  Since last retranscription
+    """
+    import sqlite3
+    import httpx
+
+    ARCHIVE_DB = Path.home() / "G121" / "audio-archive.db"
+    DEEPGRAM_API_KEY = os.environ.get("DEEPGRAM_API_KEY")
+
+    if not DEEPGRAM_API_KEY:
+        console.print("[red]DEEPGRAM_API_KEY not set[/red]")
+        return
+
+    if not ARCHIVE_DB.exists():
+        console.print("[red]Audio archive not found at ~/G121/audio-archive.db[/red]")
+        return
+
+    # Calculate time range
+    now = datetime.now()
+    end_us = int(now.timestamp() * 1_000_000)
+
+    if since_last:
+        last_time = get_last_retranscribe_time()
+        if last_time:
+            start_us = last_time
+            last_dt = datetime.fromtimestamp(last_time / 1_000_000)
+            console.print(f"[dim]Since last retranscription: {last_dt.strftime('%H:%M:%S')}[/dim]")
+        else:
+            console.print("[yellow]No previous retranscription found, using last 5 minutes[/yellow]")
+            start_us = int((now.timestamp() - 5 * 60) * 1_000_000)
+    elif last_minutes:
+        start_us = int((now.timestamp() - last_minutes * 60) * 1_000_000)
+    elif from_time and to_time:
+        # Parse times (assume today)
+        today = now.strftime("%Y-%m-%d")
+        try:
+            start_dt = datetime.fromisoformat(f"{today}T{from_time}")
+            end_dt = datetime.fromisoformat(f"{today}T{to_time}")
+            start_us = int(start_dt.timestamp() * 1_000_000)
+            end_us = int(end_dt.timestamp() * 1_000_000)
+        except ValueError as e:
+            console.print(f"[red]Invalid time format: {e}[/red]")
+            return
+    else:
+        console.print("[red]Specify --last N, --from/--to times, or --since-last[/red]")
+        return
+
+    # Query packets
+    conn = sqlite3.connect(ARCHIVE_DB)
+    rows = conn.execute('''
+        SELECT opus_data FROM opus_packets
+        WHERE captured_at_us >= ? AND captured_at_us <= ?
+        ORDER BY captured_at_us
+    ''', (start_us, end_us)).fetchall()
+    conn.close()
+
+    if not rows:
+        console.print("[yellow]No audio found in that time range[/yellow]")
+        return
+
+    duration_sec = len(rows) * 0.02  # 20ms per packet
+    console.print(f"[dim]Found {len(rows)} packets ({duration_sec:.1f}s of audio)[/dim]")
+
+    # Extract raw Opus frames
+    opus_frames = [frame for (frame,) in rows]
+
+    try:
+        # Fast mux to OggOpus (no re-encoding!)
+        console.print("[dim]Muxing to OggOpus (no re-encoding)...[/dim]")
+        ogg_data = mux_opus_to_ogg(opus_frames)
+        console.print(f"[dim]Created {len(ogg_data) / 1024:.1f}KB OggOpus[/dim]")
+
+        # Send to Deepgram batch API
+        console.print("[dim]Sending to Deepgram...[/dim]")
+
+        response = httpx.post(
+            "https://api.deepgram.com/v1/listen",
+            params={
+                "model": "nova-3",
+                "language": "en",
+                "punctuate": "true",
+                "paragraphs": "true",
+            },
+            headers={
+                "Authorization": f"Token {DEEPGRAM_API_KEY}",
+                "Content-Type": "audio/ogg",
+            },
+            content=ogg_data,
+            timeout=120,
+        )
+
+        if response.status_code != 200:
+            console.print(f"[red]Deepgram error: {response.status_code}[/red]")
+            console.print(response.text[:500])
+            return
+
+        result = response.json()
+
+        # Debug: show structure
+        channels = result.get("results", {}).get("channels", [])
+        if not channels:
+            console.print("[yellow]No channels in response[/yellow]")
+            console.print(f"[dim]{result}[/dim]")
+            return
+
+        # Get transcript from first alternative
+        alternatives = channels[0].get("alternatives", [])
+        if not alternatives:
+            console.print("[yellow]No alternatives in response[/yellow]")
+            return
+
+        transcript = alternatives[0].get("transcript", "")
+
+        if transcript:
+            console.print("\n[bold]Re-transcription:[/bold]\n")
+            console.print(transcript)
+
+            # Also show word-level if available
+            words = alternatives[0].get("words", [])
+            if words:
+                console.print(f"\n[dim]({len(words)} words detected)[/dim]")
+
+            # Save timestamp for --since-last
+            set_last_retranscribe_time(end_us)
+            console.print(f"[dim]Saved end time for --since-last[/dim]")
+        else:
+            console.print("[yellow]Empty transcript - possibly silence or no speech detected[/yellow]")
+
+    except Exception as e:
+        console.print(f"[red]Error: {e}[/red]")
+
+
+@transcript.command("follow")
+def transcript_follow():
+    """Continuously print new transcripts as they arrive.
+
+    Run this in a terminal to see live transcription output.
+    Press Ctrl+C to stop.
+    """
+    import redis
+    import signal
+    import sys
+
+    def handle_sigint(sig, frame):
+        console.print("\n[dim]Stopped.[/dim]")
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT, handle_sigint)
+
+    r = redis.Redis(decode_responses=True)
+
+    try:
+        r.ping()
+    except redis.ConnectionError:
+        console.print("[red]Cannot connect to Redis. Is it running?[/red]")
+        return
+
+    console.print("[dim]Following transcripts... (Ctrl+C to stop)[/dim]\n")
+
+    # Start from now
+    last_id = "$"
+
+    while True:
+        try:
+            # Block for up to 1 second waiting for new entries
+            result = r.xread({"transcripts": last_id}, block=1000, count=100)
+
+            if not result:
+                continue
+
+            for stream_name, entries in result:
+                for entry_id, fields in entries:
+                    last_id = entry_id
+
+                    # Only show final transcripts
+                    if fields.get("is_final") != "1":
+                        continue
+
+                    text = fields.get("transcript", "")
+                    if not text:
+                        continue
+
+                    timestamp = fields.get("timestamp", "")
+                    try:
+                        dt = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+                        time_str = dt.strftime("%H:%M:%S")
+                    except:
+                        time_str = "??:??:??"
+
+                    console.print(f"[dim]{time_str}[/dim] {text}")
+
+        except redis.ConnectionError:
+            console.print("[red]Lost connection to Redis, reconnecting...[/red]")
+            import time
+            time.sleep(1)
+            r = redis.Redis(decode_responses=True)
+
+
+if __name__ == "__main__":
+    cli()
